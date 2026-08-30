@@ -13,7 +13,7 @@ pub(crate) const SSH_MAX_PACKET: usize = 35000;
 //
 // This size is arbitrary and may be increased, though note that some code paths assume
 // a linear scan of channels can happen quickly, so may need reworking for performance.
-pub const MAX_CHANNELS: usize = 4;
+pub const MAX_CHANNELS: usize = 16;
 
 // Enough for longest 23 of "screen.konsole-256color" on my system
 // Unsure if this is specified somewhere
