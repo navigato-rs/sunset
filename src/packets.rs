@@ -336,6 +336,9 @@ pub enum PubKey<'a> {
     #[sshwire(variant = SSH_NAME_ECDSA256)]
     ECDSA256(ECDSAPubKey<p256::NistP256>),
 
+    #[sshwire(variant = SSH_NAME_SK_ED25519)]
+    SkEd25519(SkEd25519PubKey<'a>),
+
     #[sshwire(unknown)]
     Unknown(Unknown<'a>),
 }
@@ -349,6 +352,7 @@ impl PubKey<'_> {
             PubKey::RSA(_) => Ok(SSH_NAME_RSA),
             #[cfg(feature = "ecdsa256")]
             PubKey::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
+            PubKey::SkEd25519(_) => Ok(SSH_NAME_SK_ED25519),
             PubKey::Unknown(u) => Err(u),
         }
     }
@@ -408,8 +412,7 @@ impl TryFrom<&PubKey<'_>> for ssh_key::PublicKey {
                 Ok(k.into())
             }
 
-            PubKey::Unknown(u) => {
-                trace!("unsupported {u}");
+            PubKey::SkEd25519(_) | PubKey::Unknown(_) => {
                 Err(Error::msg("Unsupported OpenSSH key"))
             }
         }
@@ -420,6 +423,14 @@ impl TryFrom<&PubKey<'_>> for ssh_key::PublicKey {
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 pub struct Ed25519PubKey {
     pub key: Blob<[u8; 32]>,
+}
+
+/// `sk-ssh-ed25519@openssh.com` public key: 32-byte key plus application string.
+#[derive(Debug, Clone, PartialEq, SSHEncode, SSHDecode)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct SkEd25519PubKey<'a> {
+    pub key: Blob<[u8; 32]>,
+    pub application: BinString<'a>,
 }
 
 #[cfg(feature = "rsa")]
@@ -559,6 +570,9 @@ pub enum Signature<'a> {
     #[sshwire(variant = SSH_NAME_ECDSA256)]
     ECDSA256(Blob<ECDSASig<'a>>),
 
+    #[sshwire(variant = SSH_NAME_SK_ED25519)]
+    SkEd25519(SkEd25519Sig<'a>),
+
     #[sshwire(unknown)]
     Unknown(Unknown<'a>),
 }
@@ -572,6 +586,7 @@ impl<'a> Signature<'a> {
             Signature::RSA(_) => Ok(SSH_NAME_RSA_SHA256),
             #[cfg(feature = "ecdsa256")]
             Signature::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
+            Signature::SkEd25519(_) => Ok(SSH_NAME_SK_ED25519),
             Signature::Unknown(u) => Err(u),
         }
     }
@@ -589,6 +604,7 @@ impl<'a> Signature<'a> {
             PubKey::RSA(_) => Ok(SSH_NAME_RSA_SHA256),
             #[cfg(feature = "ecdsa256")]
             PubKey::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
+            PubKey::SkEd25519(_) => Ok(SSH_NAME_SK_ED25519),
             PubKey::Unknown(u) => {
                 warn!("Unknown key type \"{}\"", u);
                 Err(Error::UnknownMethod { kind: "key" })
@@ -603,6 +619,7 @@ impl<'a> Signature<'a> {
             Signature::RSA(_) => Ok(SigType::RSA),
             #[cfg(feature = "ecdsa256")]
             Signature::ECDSA256(_) => Ok(SigType::ECDSA256),
+            Signature::SkEd25519(_) => Ok(SigType::SkEd25519),
             Signature::Unknown(u) => {
                 warn!("Unknown signature type \"{}\"", u);
                 Err(Error::UnknownMethod { kind: "signature" })
@@ -626,6 +643,13 @@ impl<'a> From<&'a OwnedSig> for Signature<'a> {
                 r: sshwire::Mpint::new(r),
                 s: sshwire::Mpint::new(s),
             })),
+            OwnedSig::SkEd25519 { sig, flags, counter } => {
+                Signature::SkEd25519(SkEd25519Sig {
+                    sig: BinString(sig),
+                    flags: *flags,
+                    counter: *counter,
+                })
+            }
         }
     }
 }
@@ -634,6 +658,14 @@ impl<'a> From<&'a OwnedSig> for Signature<'a> {
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 pub struct Ed25519Sig<'a> {
     pub sig: BinString<'a>,
+}
+
+#[derive(Debug, SSHEncode, SSHDecode, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct SkEd25519Sig<'a> {
+    pub sig: BinString<'a>,
+    pub flags: u8,
+    pub counter: u32,
 }
 
 #[cfg(feature = "rsa")]

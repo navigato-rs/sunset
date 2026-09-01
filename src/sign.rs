@@ -13,7 +13,7 @@ use ed25519_dalek::{Signer, Verifier};
 use zeroize::ZeroizeOnDrop;
 
 use crate::*;
-use packets::{Ed25519PubKey, Ed25519Sig, PubKey, Signature};
+use packets::{Ed25519PubKey, Ed25519Sig, PubKey, Signature, SkEd25519PubKey};
 use sshnames::*;
 use sshwire::{BinString, Blob, SSHDecode, SSHEncode, WireError, WireResult};
 
@@ -59,6 +59,7 @@ const MAX_ED25519_SIG_MSG: usize = 1
 #[derive(Debug, Clone, Copy)]
 pub enum SigType {
     Ed25519,
+    SkEd25519,
     #[cfg(feature = "rsa")]
     RSA,
     #[cfg(feature = "ecdsa256")]
@@ -77,6 +78,7 @@ impl SigType {
     pub fn from_name(name: &'static str) -> Result<Self> {
         match name {
             SSH_NAME_ED25519 => Ok(SigType::Ed25519),
+            SSH_NAME_SK_ED25519 => Ok(SigType::SkEd25519),
             #[cfg(feature = "rsa")]
             SSH_NAME_RSA_SHA256 => Ok(SigType::RSA),
             #[cfg(feature = "ecdsa256")]
@@ -89,6 +91,7 @@ impl SigType {
     pub fn algorithm_name(&self) -> &'static str {
         match self {
             SigType::Ed25519 => SSH_NAME_ED25519,
+            SigType::SkEd25519 => SSH_NAME_SK_ED25519,
             #[cfg(feature = "rsa")]
             SigType::RSA => SSH_NAME_RSA_SHA256,
             #[cfg(feature = "ecdsa256")]
@@ -100,6 +103,7 @@ impl SigType {
     fn fuzz_fake_verify(&self, sig: &Signature) -> Result<()> {
         let b = match &sig {
             Signature::Ed25519(e) => e.sig.0,
+            Signature::SkEd25519(e) => e.sig.0,
             #[cfg(feature = "rsa")]
             Signature::RSA(e) => e.sig.0,
             Signature::Unknown(_) => panic!(),
@@ -268,6 +272,11 @@ impl SigType {
 pub enum OwnedSig {
     // just store raw bytes here.
     Ed25519([u8; 64]),
+    SkEd25519 {
+        sig: [u8; 64],
+        flags: u8,
+        counter: u32,
+    },
     #[cfg(feature = "rsa")]
     RSA(Box<[u8]>),
     #[cfg(feature = "ecdsa256")]
@@ -291,6 +300,10 @@ impl TryFrom<Signature<'_>> for OwnedSig {
             Signature::Ed25519(s) => {
                 let s: [u8; 64] = s.sig.0.try_into().map_err(|_| Error::BadSig)?;
                 Ok(OwnedSig::Ed25519(s))
+            }
+            Signature::SkEd25519(s) => {
+                let sig: [u8; 64] = s.sig.0.try_into().map_err(|_| Error::BadSig)?;
+                Ok(OwnedSig::SkEd25519 { sig, flags: s.flags, counter: s.counter })
             }
             #[cfg(feature = "rsa")]
             Signature::RSA(s) => Ok(OwnedSig::RSA(s.sig.0.into())),
@@ -338,6 +351,14 @@ pub enum SignKey {
 
     #[zeroize(skip)]
     AgentEd25519(dalek::VerifyingKey),
+
+    /// Agent-held `sk-ssh-ed25519@openssh.com`. The private key stays in the
+    /// authenticator; we only offer the public half and pass the agent signature.
+    #[zeroize(skip)]
+    AgentSkEd25519 {
+        key: [u8; 32],
+        application: heapless::Vec<u8, 64>,
+    },
 
     #[cfg(feature = "rsa")]
     // TODO zeroize doesn't seem supported? though BigUint has Zeroize
@@ -405,6 +426,13 @@ impl SignKey {
                 PubKey::Ed25519(Ed25519PubKey { key: Blob(pk.to_bytes()) })
             }
 
+            SignKey::AgentSkEd25519 { key, application } => {
+                PubKey::SkEd25519(SkEd25519PubKey {
+                    key: Blob(*key),
+                    application: BinString(application.as_slice()),
+                })
+            }
+
             #[cfg(feature = "rsa")]
             SignKey::RSA(k) => PubKey::RSA(RSAPubKey { key: k.into() }),
 
@@ -435,6 +463,14 @@ impl SignKey {
                 Ok(Self::AgentEd25519(k))
             }
 
+            PubKey::SkEd25519(k) => {
+                let key: [u8; 32] =
+                    k.key.0.as_slice().try_into().map_err(|_| Error::BadKey)?;
+                let application = heapless::Vec::from_slice(k.application.0)
+                    .map_err(|_| Error::msg("SK application too long"))?;
+                Ok(Self::AgentSkEd25519 { key, application })
+            }
+
             #[cfg(feature = "rsa")]
             PubKey::RSA(k) => Ok(Self::AgentRSA(k.key.clone())),
             #[cfg(feature = "ecdsa256")]
@@ -449,6 +485,10 @@ impl SignKey {
         match self {
             SignKey::Ed25519(_) | SignKey::AgentEd25519(_) => {
                 matches!(sig_type, SigType::Ed25519)
+            }
+
+            SignKey::AgentSkEd25519 { .. } => {
+                matches!(sig_type, SigType::SkEd25519)
             }
 
             #[cfg(feature = "rsa")]
@@ -515,7 +555,9 @@ impl SignKey {
             }
 
             // callers should check for agent keys first
-            SignKey::AgentEd25519(_) => unreachable!(),
+            SignKey::AgentEd25519(_) | SignKey::AgentSkEd25519 { .. } => {
+                unreachable!()
+            }
             #[cfg(feature = "rsa")]
             SignKey::AgentRSA(_) => unreachable!(),
             #[cfg(feature = "ecdsa256")]
@@ -542,7 +584,7 @@ impl SignKey {
             #[cfg(feature = "ecdsa256")]
             SignKey::ECDSA256(_) => false,
 
-            SignKey::AgentEd25519(_) => true,
+            SignKey::AgentEd25519(_) | SignKey::AgentSkEd25519 { .. } => true,
             #[cfg(feature = "rsa")]
             SignKey::AgentRSA(_) => true,
             #[cfg(feature = "ecdsa256")]
@@ -556,6 +598,7 @@ impl core::fmt::Debug for SignKey {
         let s = match self {
             Self::Ed25519(_) => "Ed25519",
             Self::AgentEd25519(_) => "AgentEd25519",
+            Self::AgentSkEd25519 { .. } => "AgentSkEd25519",
             #[cfg(feature = "rsa")]
             Self::RSA(_) => "RSA",
             #[cfg(feature = "rsa")]
