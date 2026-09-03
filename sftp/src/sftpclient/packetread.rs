@@ -172,6 +172,7 @@ pub(crate) async fn take_attrs<R: Read>(
             skip_string(r, rem).await?;
             skip_string(r, rem).await?;
         }
+        attrs.ext_count = Some(count);
     }
 
     Ok(attrs)

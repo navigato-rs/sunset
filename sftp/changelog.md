@@ -33,6 +33,12 @@
 
 ### Fixed
 
+- `Attrs` decoding now consumes extended attributes rather than stopping
+  at them. Previously a peer that sent any extended attribute had its
+  packet rejected as `SSH_FX_BAD_MESSAGE`, since the packet did not
+  decode to its full length. The extended values themselves are still
+  discarded, `Attrs::ext_count` records how many there were.
+
 - `SftpPacket::encode_request()` emitted the request id twice and is
   no longer given one, it is taken from the packet. It previously had no
   callers.
