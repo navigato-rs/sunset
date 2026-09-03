@@ -3,6 +3,7 @@ use log::LevelFilter;
 use sunset::*;
 use sunset_async::{ProgressHolder, SSHServer, SunsetMutex, SunsetRawMutex};
 use sunset_sftp::SftpServerHandler;
+use sunset_sftp::error::SftpError;
 use sunset_sftp::server::MAX_REQUEST_LEN;
 
 use sunset_demo_common::{self, DemoCommon, DemoServer, SSHConfig};
@@ -160,25 +161,21 @@ impl DemoServer for StdDemo {
 
                 info!("SFTP loop has received a channel handle {:?}", ch.num());
 
-                match {
-                    let (chan_in, chan_out) = serv.stdio(ch).await?.split();
-                    let mut file_server = DemoSftpServer::new(
-                        "./demo/sftp/std/testing/out/".to_string(),
-                    );
+                let (chan_in, chan_out) = serv.stdio(ch).await?.split();
+                let mut file_server =
+                    DemoSftpServer::new("./demo/sftp/std/testing/out/".to_string());
 
-                    sftp_handler.run(&mut file_server, chan_in, chan_out).await?;
-
-                    Ok::<_, Error>(())
-                } {
-                    Ok(_) => {
-                        warn!("sftp server loop finished gracefully");
-                        return Ok(());
+                match sftp_handler.run(&mut file_server, chan_in, chan_out).await {
+                    // The client closing the channel ends the session,
+                    // and another may follow on this connection.
+                    Ok(()) | Err(SftpError::Disconnected) => {
+                        info!("sftp session finished")
                     }
                     Err(e) => {
-                        error!("sftp server loop finished with an error: {}", e);
-                        return Err(e);
+                        error!("sftp session failed: {:?}", e);
+                        return Err(e.into());
                     }
-                };
+                }
             }
             Ok::<_, Error>(())
         };
@@ -203,7 +200,7 @@ async fn listen(
     stack: Stack<'static>,
     config: &'static SunsetMutex<SSHConfig>,
 ) -> ! {
-    let demo = StdDemo::default();
+    let demo = StdDemo;
     sunset_demo_common::listen(stack, config, &demo).await
 }
 

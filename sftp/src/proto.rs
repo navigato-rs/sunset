@@ -98,9 +98,22 @@ impl<'a> From<&'a str> for Filename<'a> {
 
 // TODO standardize the encoding of filenames as str
 impl<'a> Filename<'a> {
+    /// Wraps raw bytes as a name.
+    ///
+    /// SFTP version 3 doesn't define an encoding for names, so they
+    /// aren't required to be UTF-8.
+    pub fn new(name: &'a [u8]) -> Self {
+        Filename(TextString(name))
+    }
+
     /// Return the name as a `str`.
     pub fn as_str(&self) -> Result<&'a str, WireError> {
         core::str::from_utf8(self.0.0).map_err(|_| WireError::BadString)
+    }
+
+    /// Return the raw name.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.0.0
     }
 }
 
@@ -1257,7 +1270,7 @@ mod proto_tests {
         let sl = sink.payload_slice();
         println!("attr_read_only encoded_len = {:?}, encoded = {:?}", len, sl);
 
-        let (a_r, l_r) = sshwire::read_ssh::<Attrs>(&sl, None).unwrap();
+        let (a_r, l_r) = sshwire::read_ssh::<Attrs>(sl, None).unwrap();
         assert_eq!(attr_read_only, a_r);
         assert_eq!(len, l_r);
     }

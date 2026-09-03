@@ -200,7 +200,6 @@ mod enforcing_process_tests {
 
     extern crate alloc;
     extern crate std;
-    use alloc::vec;
     use std::vec::Vec;
 
     #[test]
@@ -243,7 +242,7 @@ mod enforcing_process_tests {
         let mut producer = SftpOutputProducer::new(&mut mock, &mut buf);
 
         // 1. Put together a collection of synthetic directory entries
-        let filenames = vec!["file1", "file2", "file3"];
+        let filenames = ["file1", "file2", "file3"];
         let name_entries: Vec<NameEntry<'_>> = filenames
             .iter()
             .map(|name| NameEntry {
@@ -316,9 +315,11 @@ mod enforcing_process_tests {
 
 /// no_std compatible helpers to perform common tasks using solely sunset and sunset-sftp resources
 pub mod helpers {
+    use core::fmt::Write;
+
     use crate::{
-        error::SftpResult,
-        proto::{MAX_NAME_ENTRY_SIZE, NameEntry},
+        error::{SftpError, SftpResult},
+        proto::{Attrs, MAX_NAME_ENTRY_SIZE, NameEntry},
         sftpsink::SftpSink,
     };
 
@@ -334,5 +335,168 @@ pub mod helpers {
         let mut temp_sink = SftpSink::new(&mut buf);
         name_entry.enc(&mut temp_sink)?;
         Ok(temp_sink.payload_len() as u32)
+    }
+
+    /// Space needed by [`write_long_name`] for everything but the name.
+    pub const LONG_NAME_PREFIX_LEN: usize = 64;
+
+    /// Formats an `ls -l` style long name into `buf`.
+    ///
+    /// SFTP version 3 leaves the `longname` field of a `SSH_FXP_NAME`
+    /// entry undefined and says clients shouldn't parse it, but
+    /// OpenSSH's `sftp` prints it verbatim for `ls -l`. A server that
+    /// sends an empty long name gives blank lines there, so it is worth
+    /// filling in.
+    ///
+    /// SFTP has no link count, so 1 is always reported. Fails with
+    /// [`SftpError::NoRoom`] unless `buf` has room for the name plus
+    /// [`LONG_NAME_PREFIX_LEN`].
+    pub fn write_long_name<'b>(
+        buf: &'b mut [u8],
+        filename: &[u8],
+        attrs: &Attrs,
+    ) -> SftpResult<&'b [u8]> {
+        let mode = attrs.permissions.unwrap_or(0);
+
+        // The file type, from the S_IFMT bits
+        let kind = match mode & 0o170000 {
+            0o040000 => 'd',
+            0o120000 => 'l',
+            0o100000 => '-',
+            0o020000 => 'c',
+            0o060000 => 'b',
+            0o010000 => 'p',
+            0o140000 => 's',
+            _ => '?',
+        };
+
+        let mut w = SliceWrite { buf, pos: 0 };
+        w.write_char(kind).map_err(|_| SftpError::NoRoom)?;
+        for shift in [6, 3, 0] {
+            let bits = (mode >> shift) & 0o7;
+            for (bit, c) in [(0o4, 'r'), (0o2, 'w'), (0o1, 'x')] {
+                let c = if bits & bit != 0 { c } else { '-' };
+                w.write_char(c).map_err(|_| SftpError::NoRoom)?;
+            }
+        }
+
+        write!(
+            w,
+            " {:>3} {:<8} {:<8} {:>8} ",
+            1,
+            attrs.uid.unwrap_or(0),
+            attrs.gid.unwrap_or(0),
+            attrs.size.unwrap_or(0),
+        )
+        .map_err(|_| SftpError::NoRoom)?;
+
+        match attrs.mtime {
+            Some(t) => write_time(&mut w, t),
+            // Keep the columns lined up
+            None => write!(w, "            "),
+        }
+        .map_err(|_| SftpError::NoRoom)?;
+        w.write_char(' ').map_err(|_| SftpError::NoRoom)?;
+
+        let pos = w.pos;
+        let end = pos.checked_add(filename.len()).ok_or(SftpError::NoRoom)?;
+        let out = buf.get_mut(..end).ok_or(SftpError::NoRoom)?;
+        out[pos..].copy_from_slice(filename);
+        Ok(out)
+    }
+
+    /// Formats a unix timestamp as `ls -l` does, in UTC.
+    fn write_time(w: &mut SliceWrite<'_>, secs: u32) -> core::fmt::Result {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+            "Nov", "Dec",
+        ];
+
+        let days = (secs / 86400) as i64;
+        let time_of_day = secs % 86400;
+
+        // Days to a civil date, from Howard Hinnant's chrono algorithms
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+
+        write!(
+            w,
+            "{} {:>2} {:02}:{:02}",
+            MONTHS[(month - 1) as usize],
+            day,
+            time_of_day / 3600,
+            (time_of_day % 3600) / 60,
+        )
+    }
+
+    /// Formats into a fixed slice, for `no_std` without allocation.
+    struct SliceWrite<'a> {
+        buf: &'a mut [u8],
+        pos: usize,
+    }
+
+    impl Write for SliceWrite<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let end = self.pos.checked_add(s.len()).ok_or(core::fmt::Error)?;
+            let d = self.buf.get_mut(self.pos..end).ok_or(core::fmt::Error)?;
+            d.copy_from_slice(s.as_bytes());
+            self.pos = end;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn long_name_matches_ls() {
+            let attrs = Attrs {
+                size: Some(3000000),
+                uid: Some(0),
+                gid: Some(0),
+                permissions: Some(0o100644),
+                // 2026-09-03 16:32:00 UTC
+                mtime: Some(1788453120),
+                ..Default::default()
+            };
+            let mut buf = [0u8; 128];
+            let l = write_long_name(&mut buf, b"big.bin", &attrs).unwrap();
+            assert_eq!(
+                core::str::from_utf8(l).unwrap(),
+                "-rw-r--r--   1 0        0         3000000 Sep  3 16:32 big.bin"
+            );
+        }
+
+        #[test]
+        fn long_name_kinds() {
+            let dir = Attrs { permissions: Some(0o040755), ..Default::default() };
+            let mut buf = [0u8; 128];
+            let l = write_long_name(&mut buf, b"d", &dir).unwrap();
+            assert!(l.starts_with(b"drwxr-xr-x"));
+
+            let link = Attrs { permissions: Some(0o120777), ..Default::default() };
+            let l = write_long_name(&mut buf, b"l", &link).unwrap();
+            assert!(l.starts_with(b"lrwxrwxrwx"));
+
+            // Nothing known about it
+            let l = write_long_name(&mut buf, b"x", &Attrs::default()).unwrap();
+            assert!(l.starts_with(b"?---------"));
+        }
+
+        #[test]
+        fn long_name_needs_room() {
+            let mut buf = [0u8; 8];
+            assert!(matches!(
+                write_long_name(&mut buf, b"x", &Attrs::default()),
+                Err(SftpError::NoRoom)
+            ));
+        }
     }
 }

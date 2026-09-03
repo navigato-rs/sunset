@@ -20,6 +20,11 @@
 - `SftpError` has new `BadResponse`, `NoRoom`, `BadHandle` and
   `Interrupted` variants, used by the client.
 
+- `server::helpers::write_long_name()` formats the `ls -l` style line
+  that goes in a directory entry's `longname`. OpenSSH's client prints
+  that field verbatim for `ls -l`, so a server sending an empty one
+  gives blank lines there.
+
 - The `posix-rename@openssh.com`, `hardlink@openssh.com` and
   `fsync@openssh.com` extensions on both sides. A server announces what
   it implements with `SftpServer::extensions()`, and the handler

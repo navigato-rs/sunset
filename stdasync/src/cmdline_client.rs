@@ -318,9 +318,17 @@ impl CmdlineClient {
                         match knownhosts::check_known_hosts(
                             &self.host, self.port, &key,
                         ) {
-                            Ok(()) => h.accept(),
-                            Err(_e) => h.reject(),
-                        }?;
+                            Ok(()) => h.accept()?,
+                            Err(e) => {
+                                h.reject()?;
+                                // Otherwise the session fails later with
+                                // something that doesn't say why.
+                                warn!("Host key rejected: {e:?}");
+                                return Err(Error::msg(
+                                    "host key verification failed",
+                                ));
+                            }
+                        }
                     }
                     CliEvent::Username(u) => {
                         u.username(&self.username)?;

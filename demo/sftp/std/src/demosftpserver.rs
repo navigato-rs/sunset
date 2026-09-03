@@ -74,7 +74,7 @@ impl<V, const N: usize> ArrayMap<V, N> {
                 return Ok(i);
             }
         }
-        return Err(v);
+        Err(v)
     }
 
     fn get(&mut self, index: usize) -> Option<&mut V> {
@@ -397,7 +397,7 @@ impl SftpServer for DemoSftpServer {
                 }
             })
             .await?;
-        return Ok(finished);
+        Ok(finished)
     }
 
     async fn write(
@@ -407,7 +407,7 @@ impl SftpServer for DemoSftpServer {
         buf: &[u8],
     ) -> SftpOpResult<()> {
         let Some(private_file_handle) = self.files.get(fh.0 as usize) else {
-            return Err(StatusCode::SSH_FX_NO_SUCH_FILE.into());
+            return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
         };
 
         let permissions_poxit = (private_file_handle
@@ -451,7 +451,7 @@ impl SftpServer for DemoSftpServer {
 
         let Some(dir) = self.dirs.get(dh.0 as usize) else {
             debug!("Could not find the directory for {:?}", dh);
-            return Err(StatusCode::SSH_FX_NO_SUCH_FILE.into());
+            return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
         };
 
         if dir.read_status == ReadStatus::EndOfFile {
@@ -491,10 +491,10 @@ impl SftpServer for DemoSftpServer {
 
             dir.read_status = ReadStatus::EndOfFile;
 
-            return Ok(finish_token);
+            Ok(finish_token)
         } else {
             error!("the path is not a directory = {:?}", dir_path);
-            return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
+            Err(StatusCode::SSH_FX_NO_SUCH_FILE)
         }
     }
 

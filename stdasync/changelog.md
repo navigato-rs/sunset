@@ -12,6 +12,9 @@
 
 ### Fixed
 
+- A rejected host key now fails with "host key verification failed"
+  rather than a generic error that didn't say what went wrong.
+
 - `sunsetc` sets `TCP_NODELAY`, as OpenSSH does. Without it Nagle held
   each small packet back until the peer's delayed ACK, adding tens of
   milliseconds to every keystroke and to every request of a
