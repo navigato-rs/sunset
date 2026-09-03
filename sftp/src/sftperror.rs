@@ -25,6 +25,23 @@ pub enum SftpError {
     NotSupported,
     /// The connection has been closed, either by the peer or a transport error.
     Disconnected,
+    /// The peer sent a response that doesn't belong to the request that
+    /// was made, or a response that isn't valid for that request.
+    BadResponse,
+    /// A buffer was too small to hold a value from the peer.
+    ///
+    /// The SFTP session is still usable, the value was discarded.
+    NoRoom,
+    /// A handle was used for the wrong kind of operation, for example
+    /// reading from a directory handle.
+    BadHandle,
+    /// A previous request was interrupted, so the position in the stream
+    /// is unknown.
+    ///
+    /// This happens when the future of a
+    /// [`SftpClient`](crate::client::SftpClient) request is dropped
+    /// before completing. The connection must be closed.
+    Interrupted,
     /// The [`crate::sftpserver::SftpServer`] failed doing an IO operation
     FileServerError(StatusCode),
     /// A variant containing a [`WireError`]
@@ -82,6 +99,10 @@ impl From<SftpError> for SunsetError {
             | SftpError::NotSupported
             | SftpError::AlreadyInitialized
             | SftpError::MalformedPacket
+            | SftpError::BadResponse
+            | SftpError::NoRoom
+            | SftpError::BadHandle
+            | SftpError::Interrupted
             | SftpError::FileServerError(_) => {
                 warn!("Casting error loosing information: {:?}", value);
                 sunset::error::PacketWrong.build()
