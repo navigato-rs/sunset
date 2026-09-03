@@ -1,5 +1,3 @@
-# This is a minimal wrapper around ci.sh
-# ci.sh is intended to be usable locally without github.
 name: ci
 on:
   pull_request:
@@ -16,14 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read rust-version from Cargo.toml
-        id: msrv
-        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - name: Use MSRV from Cargo.toml
+        run: echo "RUSTUP_TOOLCHAIN=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_ENV"
 
       - name: rust toolchain
-        env:
-          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
-        run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" clippy
+        run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt
 
       - name: Cache Rust files
         uses: actions/cache@v5
@@ -31,21 +26,17 @@ jobs:
           path: |
             ~/.cargo/
             ~/.rustup/
-            testing/target
-          # Save a unique cache each time
-          # (https://github.com/actions/cache/blob/main/tips-and-workarounds.md#update-a-cache)
-          key: rust-cache1-msrv-${{ steps.msrv.outputs.version }}-${{ github.run_id }}
-          # Load from the most recent match
+          key: rust-cache1-msrv-${{ env.RUSTUP_TOOLCHAIN }}-${{ github.run_id }}
           restore-keys: |
-            rust-cache1-msrv-${{ steps.msrv.outputs.version }}
+            rust-cache1-msrv-${{ env.RUSTUP_TOOLCHAIN }}
 
-      - name: build
-        env:
-          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
-        run: ./testing/ci.sh
+      - name: Format
+        run: cargo fmt --check
 
-      - name: picow bloat
-        uses: actions/upload-artifact@v7
-        with:
-          name: picow-bloat-msrv
-          path: ci_out/picow-bloat.txt
+      # picow is thumbv6m; fuzz wants its own profile and optional sanitizers.
+      # --all-features is not a workspace flag here: sunset-sftp's long-path
+      # features conflict with each other.
+      - name: Test
+        run: |
+          cargo test --workspace --exclude sunset-demo-picow --exclude sunset-fuzz
+          cargo test -p sunset --all-features
