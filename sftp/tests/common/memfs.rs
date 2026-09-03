@@ -137,6 +137,11 @@ impl MemFs {
         }
     }
 
+    /// The path an open file handle refers to.
+    fn path_of(&self, handle: FileHandle) -> SftpOpResult<String> {
+        self.open_files.get(&handle.0).cloned().ok_or(StatusCode::SSH_FX_FAILURE)
+    }
+
     fn parent_is_dir(&self, path: &str) -> bool {
         parent_of(path)
             .and_then(|p| self.nodes.get(&p).cloned())
@@ -205,11 +210,7 @@ impl SftpServer for MemFs {
         len: u32,
         mut reply: ReadHeaderReply<'_, '_, W>,
     ) -> SftpResult<ReadReplyFinished> {
-        let path = self
-            .open_files
-            .get(&handle.0)
-            .cloned()
-            .ok_or(SftpError::from(StatusCode::SSH_FX_FAILURE))?;
+        let path = self.path_of(handle)?;
         let Some(Node::File { data, .. }) = self.nodes.get(&path) else {
             return Err(StatusCode::SSH_FX_NO_SUCH_FILE.into());
         };
@@ -239,11 +240,7 @@ impl SftpServer for MemFs {
         offset: u64,
         buf: &[u8],
     ) -> SftpOpResult<()> {
-        let path = self
-            .open_files
-            .get(&handle.0)
-            .cloned()
-            .ok_or(StatusCode::SSH_FX_FAILURE)?;
+        let path = self.path_of(handle)?;
         let Some(Node::File { data, .. }) = self.nodes.get_mut(&path) else {
             return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
         };
@@ -376,11 +373,7 @@ impl SftpServer for MemFs {
     }
 
     async fn fattrs(&mut self, handle: FileHandle) -> SftpOpResult<Attrs> {
-        let path = self
-            .open_files
-            .get(&handle.0)
-            .cloned()
-            .ok_or(StatusCode::SSH_FX_FAILURE)?;
+        let path = self.path_of(handle)?;
         self.nodes
             .get(&path)
             .map(|n| n.attrs())
@@ -409,11 +402,7 @@ impl SftpServer for MemFs {
         handle: FileHandle,
         attrs: &Attrs,
     ) -> SftpOpResult<()> {
-        let path = self
-            .open_files
-            .get(&handle.0)
-            .cloned()
-            .ok_or(StatusCode::SSH_FX_FAILURE)?;
+        let path = self.path_of(handle)?;
         self.set_attrs(&path, attrs).await
     }
 
@@ -493,10 +482,7 @@ impl SftpServer for MemFs {
 
     async fn fsync(&mut self, handle: FileHandle) -> SftpOpResult<()> {
         // Nothing to flush, but the handle must be one of ours
-        self.open_files
-            .contains_key(&handle.0)
-            .then_some(())
-            .ok_or(StatusCode::SSH_FX_FAILURE)
+        self.path_of(handle).map(|_| ())
     }
 
     async fn rename(&mut self, old_path: &str, new_path: &str) -> SftpOpResult<()> {

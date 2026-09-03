@@ -23,6 +23,11 @@
 - `SftpError` has new `BadResponse`, `NoRoom`, `BadHandle` and
   `Interrupted` variants, used by the client.
 
+- `SftpError` and `StatusCode` implement `Display`, and `SftpError`
+  implements `core::error::Error`. Callers can use `?` and the usual
+  error handling crates with it, rather than writing their own
+  conversion and their own wording for each status.
+
 - `server::helpers::write_long_name()` formats the `ls -l` style line
   that goes in a directory entry's `longname`. OpenSSH's client prints
   that field verbatim for `ls -l`, so a server sending an empty one

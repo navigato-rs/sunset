@@ -650,6 +650,25 @@ pub enum StatusCode {
     Other(u32),
 }
 
+impl core::fmt::Display for StatusCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StatusCode::SSH_FX_OK => f.write_str("OK"),
+            StatusCode::SSH_FX_EOF => f.write_str("end of file"),
+            StatusCode::SSH_FX_NO_SUCH_FILE => f.write_str("no such file"),
+            StatusCode::SSH_FX_PERMISSION_DENIED => f.write_str("permission denied"),
+            StatusCode::SSH_FX_FAILURE => f.write_str("failure"),
+            StatusCode::SSH_FX_BAD_MESSAGE => f.write_str("bad message"),
+            StatusCode::SSH_FX_NO_CONNECTION => f.write_str("no connection"),
+            StatusCode::SSH_FX_CONNECTION_LOST => f.write_str("connection lost"),
+            StatusCode::SSH_FX_OP_UNSUPPORTED => {
+                f.write_str("operation not supported by the server")
+            }
+            StatusCode::Other(n) => write!(f, "status {n}"),
+        }
+    }
+}
+
 impl<'de> SSHDecode<'de> for StatusCode {
     fn dec<S>(s: &mut S) -> WireResult<Self>
     where

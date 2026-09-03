@@ -112,5 +112,30 @@ impl From<SftpError> for SunsetError {
     }
 }
 
+impl core::fmt::Display for SftpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SftpError::NotInitialized => f.write_str("SFTP is not initialized"),
+            SftpError::AlreadyInitialized => {
+                f.write_str("SFTP is already initialized")
+            }
+            SftpError::MalformedPacket => f.write_str("malformed SFTP packet"),
+            SftpError::NotSupported => f.write_str("not supported"),
+            SftpError::Disconnected => f.write_str("disconnected"),
+            SftpError::BadResponse => f.write_str("unexpected SFTP response"),
+            SftpError::NoRoom => f.write_str("buffer too small"),
+            SftpError::BadHandle => f.write_str("wrong kind of handle"),
+            SftpError::Interrupted => {
+                f.write_str("SFTP was interrupted, the session can't continue")
+            }
+            SftpError::FileServerError(code) => write!(f, "{code}"),
+            SftpError::WireError(e) => write!(f, "encoding error: {e:?}"),
+            SftpError::SunsetError(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl core::error::Error for SftpError {}
+
 /// result specific to this SFTP lib
 pub type SftpResult<T> = Result<T, SftpError>;
