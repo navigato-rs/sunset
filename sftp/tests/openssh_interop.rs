@@ -98,13 +98,13 @@ fn version_and_extensions() {
 #[test]
 fn write_and_read_a_file() {
     with_openssh("readwrite", |mut client, dir| async move {
-        let content: Vec<u8> = (0..70_000u32).map(|i| (i * 7) as u8).collect();
+        let content: Vec<u8> = (0..600_000u32).map(|i| (i * 7) as u8).collect();
         let p = dir.path("f");
 
         let h = client.create(&p).await?;
-        for (i, chunk) in content.chunks(16 * 1024).enumerate() {
-            client.write(&h, (i * 16 * 1024) as u64, chunk).await?;
-        }
+        // Larger than MAX_WRITE_LEN and than the pipeline depth, so the
+        // client splits it and keeps several requests in flight
+        client.write(&h, 0, &content).await?;
         // The OpenSSH fsync extension
         client.fsync(&h).await?;
         assert_eq!(client.fstat(&h).await?.size, Some(content.len() as u64));
@@ -115,8 +115,9 @@ fn write_and_read_a_file() {
 
         let h = client.open_read(&p).await?;
         let mut got = Vec::new();
-        // Larger than MAX_READ_LEN, so reads are capped and repeated
-        let mut buf = vec![0u8; 50_000];
+        // Larger than MAX_READ_LEN, so each call is split into several
+        // pipelined requests
+        let mut buf = vec![0u8; 300_000];
         loop {
             let n = client.read(&h, got.len() as u64, &mut buf).await?;
             if n == 0 {

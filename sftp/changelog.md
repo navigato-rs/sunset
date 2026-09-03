@@ -6,8 +6,10 @@
 
 - A SFTP client, `sunset_sftp::client::SftpClient`. It covers the
   version 3 requests, streaming file contents and directory listings
-  rather than buffering them. Requests are made one at a time, without
-  pipelining.
+  rather than buffering them. Reads and writes larger than one packet
+  are split into `MAX_READ_LEN`/`MAX_WRITE_LEN` requests and pipelined
+  `PIPELINE_DEPTH` deep, so a transfer isn't limited to one block per
+  round trip.
 
 - `SftpServer` handles more requests: `SSH_FXP_FSTAT`, `SSH_FXP_SETSTAT`,
   `SSH_FXP_FSETSTAT`, `SSH_FXP_REMOVE`, `SSH_FXP_MKDIR`, `SSH_FXP_RMDIR`,

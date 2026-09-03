@@ -13,8 +13,8 @@ For a client, `SftpClient` makes requests over a SSH channel that has had
 the `sftp` subsystem started on it. `sftpc` in `sunset-stdasync` is a
 commandline client using it. File contents and directory listings
 are streamed rather than buffered, so transfers aren't limited by the
-client's buffer size. Requests aren't pipelined, so each block of a
-transfer costs a round trip.
+client's buffer size. Reads and writes larger than one packet are split
+and pipelined, so a transfer doesn't cost a round trip per block.
 
 This crate should also be usable separately from Sunset with
 async `Read`/`Write` implementations.

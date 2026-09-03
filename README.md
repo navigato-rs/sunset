@@ -52,7 +52,6 @@ Working:
 
 Desirable:
 
-- SFTP request pipelining
 - sntrup761
 - Inbound / remote TCP forwarding (`forwarded-tcpip`)
 - A std server example

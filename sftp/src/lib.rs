@@ -47,8 +47,9 @@
 //! ```
 //!
 //! File contents and directory listings are streamed, so transfers
-//! aren't limited by the client's buffer size. Requests are made one at
-//! a time, without pipelining.
+//! aren't limited by the client's buffer size. Reads and writes larger
+//! than one packet are split and pipelined, so a transfer isn't limited
+//! to one chunk per round trip.
 //!
 //! # Roadmap
 //!
@@ -87,7 +88,7 @@
 //! ## Client
 //!
 //! - [x] A commandline SFTP client, `sftpc` in `sunset-stdasync`
-//! - [ ] Pipelining requests, to avoid a round trip per block transferred
+//! - [x] Pipelining transfers, to avoid a round trip per block
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -142,8 +143,8 @@ pub mod server {
 /// channel that has had the `sftp` subsystem started on it.
 pub mod client {
     pub use crate::sftpclient::{
-        DEFAULT_CLIENT_BUF, Extensions, MAX_READ_LEN, RemoteHandle, SftpClient,
-        pflags,
+        DEFAULT_CLIENT_BUF, Extensions, MAX_READ_LEN, MAX_WRITE_LEN, PIPELINE_DEPTH,
+        RemoteHandle, SftpClient, pflags,
     };
     pub use crate::sftpclient::{DirEntry, DirIter};
 }
