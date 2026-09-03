@@ -18,6 +18,16 @@ transfer costs a round trip.
 This crate should also be usable separately from Sunset with
 async `Read`/`Write` implementations.
 
+## Testing
+
+`cargo test -p sunset-sftp` runs the client against `SftpServerHandler`
+over an in-memory pipe, and checks request encoding at the byte level.
+
+`tests/openssh_interop.rs` additionally runs the client against OpenSSH's
+`sftp-server`, which speaks SFTP over stdin/stdout without any SSH around
+it. Those tests skip themselves when OpenSSH isn't installed; on Debian
+and Ubuntu the binary comes from the `openssh-sftp-server` package.
+
 ### Credits
 
 This was implemenented by Julio Beltran Ortega (@jubeormk1) as part of
