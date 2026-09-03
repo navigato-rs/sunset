@@ -22,11 +22,19 @@ where
     F: FnOnce(Client) -> Fut,
     Fut: Future<Output = Result<(), SftpError>>,
 {
+    with_server(MemFs::new(), f)
+}
+
+/// Runs `f` with a client connected to `fs`.
+fn with_server<F, Fut>(mut fs: MemFs, f: F)
+where
+    F: FnOnce(Client) -> Fut,
+    Fut: Future<Output = Result<(), SftpError>>,
+{
     let c2s = Pipe::new();
     let s2c = Pipe::new();
 
     let mut handler = SftpServerHandler::default();
-    let mut fs = MemFs::new();
 
     let server = handler.run(&mut fs, c2s.reader(), s2c.writer());
 
@@ -343,16 +351,51 @@ fn attributes() {
 }
 
 #[test]
-fn unsupported_operation() {
-    with_client(|mut client| async move {
-        // MemFs doesn't implement it, and the server has no extensions
-        assert!(!client.extensions().posix_rename);
+fn a_server_without_extensions() {
+    with_server(MemFs::without_extensions(), |mut client| async move {
+        let e = client.extensions();
+        assert!(!e.posix_rename && !e.hardlink && !e.fsync);
+
+        // Not announced, so the client doesn't send the request
         assert!(matches!(
             client.posix_rename("/a", "/b").await,
             Err(SftpError::NotSupported)
         ));
+        assert!(matches!(
+            client.hardlink("/a", "/b").await,
+            Err(SftpError::NotSupported)
+        ));
         // Still usable
         assert!(client.stat("/").await.is_ok());
+        Ok(())
+    })
+}
+
+#[test]
+fn openssh_extensions() {
+    with_client(|mut client| async move {
+        let e = client.extensions();
+        assert!(e.posix_rename && e.hardlink && e.fsync);
+        assert!(!e.statvfs, "not announced by MemFs");
+
+        let h = client.create("/a").await?;
+        client.write(&h, 0, b"hello").await?;
+        client.fsync(&h).await?;
+        client.close(&h).await?;
+
+        let h = client.create("/b").await?;
+        client.close(&h).await?;
+
+        // Plain rename won't replace /b, posix-rename will
+        assert!(client.rename("/a", "/b").await.is_err());
+        client.posix_rename("/a", "/b").await?;
+        assert!(client.stat("/a").await.is_err());
+        assert_eq!(client.stat("/b").await?.size, Some(5));
+
+        client.hardlink("/b", "/c").await?;
+        assert_eq!(client.stat("/c").await?.size, Some(5));
+        // Onto an existing name it fails
+        assert!(client.hardlink("/b", "/c").await.is_err());
         Ok(())
     })
 }

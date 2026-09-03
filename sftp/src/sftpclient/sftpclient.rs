@@ -5,7 +5,7 @@ use sunset::sshwire::{BinString, SSHEncode, TextString};
 
 use crate::error::{SftpError, SftpResult};
 use crate::proto::{
-    Attrs, Close, FSetStat, FStat, Filename, InitVersionClient, LStat,
+    Attrs, Close, Extensions, FSetStat, FStat, Filename, InitVersionClient, LStat,
     MAX_HANDLE_LEN, MAX_REQUEST_LEN, MkDir, OpaqueHandle, Open, OpenDir, PFlags,
     PathInfo, ReadDir, ReadLink, Remove, Rename, ReqId, RmDir,
     SFTP_MAXIMUM_PACKET_LEN, SFTP_MINIMUM_PACKET_LEN, SFTP_VERSION,
@@ -141,24 +141,6 @@ impl fmt::Debug for RemoteHandle {
     }
 }
 
-/// Optional protocol extensions advertised by the server.
-///
-/// Populated from the `SSH_FXP_VERSION` response, see
-/// [`SftpClient::extensions`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Extensions {
-    /// `posix-rename@openssh.com`, see [`SftpClient::posix_rename`]
-    pub posix_rename: bool,
-    /// `hardlink@openssh.com`, see [`SftpClient::hardlink`]
-    pub hardlink: bool,
-    /// `fsync@openssh.com`, see [`SftpClient::fsync`]
-    pub fsync: bool,
-    /// `statvfs@openssh.com`, not implemented
-    pub statvfs: bool,
-    /// `limits@openssh.com`, not implemented
-    pub limits: bool,
-}
-
 /// A SFTP client.
 ///
 /// Wraps the [`Read`] and [`Write`] halves of a SSH channel that has had
@@ -257,7 +239,7 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         self.version
     }
 
-    /// Extensions advertised by the server in its `SSH_FXP_VERSION`.
+    /// Extensions announced by the server in its `SSH_FXP_VERSION`.
     pub fn extensions(&self) -> Extensions {
         self.extensions
     }
@@ -611,15 +593,8 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
                     &mut self.buf,
                 )
                 .await?;
-                match name {
-                    Some(b"posix-rename@openssh.com") => {
-                        self.extensions.posix_rename = true
-                    }
-                    Some(b"hardlink@openssh.com") => self.extensions.hardlink = true,
-                    Some(b"fsync@openssh.com") => self.extensions.fsync = true,
-                    Some(b"statvfs@openssh.com") => self.extensions.statvfs = true,
-                    Some(b"limits@openssh.com") => self.extensions.limits = true,
-                    _ => trace!("Ignoring unknown SFTP extension"),
+                if let Some(name) = name {
+                    self.extensions.set_by_name(name);
                 }
                 // extension data
                 skip_string(&mut self.reader, &mut self.pkt_remaining).await?;

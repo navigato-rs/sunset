@@ -4,8 +4,9 @@ use core::task::{Poll, Waker};
 
 use crate::error::SftpError;
 use crate::proto::{
-    self, InitVersionClient, InitVersionLowest, LStat, MAX_REQUEST_LEN, NameEntry,
-    ReqId, SFTP_VERSION, SftpPacket, Stat, StatusCode,
+    self, Extensions, InitVersionClient, InitVersionLowest, LStat, MAX_REQUEST_LEN,
+    NameEntry, OpaqueHandle, Rename, ReqId, SFTP_VERSION, SftpNum, SftpPacket, Stat,
+    StatusCode,
 };
 use crate::server::DirReadHeaderReply;
 use crate::sftperror::SftpResult;
@@ -16,6 +17,7 @@ use crate::sftpserver::{FileOrDirHandle, decode_opaque_handle};
 use crate::sftpsource::{SftpDecoded, SftpSource};
 
 use sunset::error::TrapBug;
+use sunset::sshwire::{self, SSHEncode};
 
 use embassy_futures::select::{Either, select};
 use embedded_io_async::{Read, Write};
@@ -263,11 +265,16 @@ where
 
         match sftp_packet {
             SftpPacket::Init(InitVersionClient { version: SFTP_VERSION }) => {
-                output_producer
-                    .send_packet(&SftpPacket::Version(InitVersionLowest {
-                        version: SFTP_VERSION,
-                    }))
-                    .await?;
+                let ext = self.file_server.extensions();
+                if ext == Extensions::default() {
+                    output_producer
+                        .send_packet(&SftpPacket::Version(InitVersionLowest {
+                            version: SFTP_VERSION,
+                        }))
+                        .await?;
+                } else {
+                    send_version_extensions(output_producer, ext).await?;
+                }
                 Ok(())
             }
             SftpPacket::Init(InitVersionClient { version }) => {
@@ -551,6 +558,52 @@ where
                 send_op_status(output_producer, req_id, res, "Symlink failed")
                     .await?;
             }
+            SftpPacket::Extended(req_id, ext) => {
+                let name = ext.name.0;
+                debug!("Extended request {:?}", ext.name);
+
+                let res = match name {
+                    b"posix-rename@openssh.com" => {
+                        match decode_exact::<Rename>(ext.data) {
+                            Ok(r) => {
+                                self.file_server
+                                    .posix_rename(
+                                        r.old_path.to_str()?,
+                                        r.new_path.to_str()?,
+                                    )
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    b"hardlink@openssh.com" => {
+                        match decode_exact::<Rename>(ext.data) {
+                            Ok(r) => {
+                                self.file_server
+                                    .hardlink(
+                                        r.old_path.to_str()?,
+                                        r.new_path.to_str()?,
+                                    )
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    b"fsync@openssh.com" => {
+                        match decode_exact::<OpaqueHandle>(ext.data) {
+                            Ok(h) => match FileHandle::try_from(h) {
+                                Ok(h) => self.file_server.fsync(h).await,
+                                Err(e) => Err(e),
+                            },
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => Err(StatusCode::SSH_FX_OP_UNSUPPORTED),
+                };
+
+                send_op_status(output_producer, req_id, res, "Extended failed")
+                    .await?;
+            }
             SftpPacket::Init(..)
             | SftpPacket::Version(..)
             | SftpPacket::Status(..)
@@ -700,6 +753,40 @@ where
 
         Ok(())
     }
+}
+
+/// Decodes an extended request's payload, which must use all of it.
+fn decode_exact<'a, T: sshwire::SSHDecode<'a>>(data: &'a [u8]) -> SftpOpResult<T> {
+    match sshwire::read_ssh::<T>(data, None) {
+        Ok((v, len)) if len == data.len() => Ok(v),
+        _ => {
+            debug!("Bad extended request payload");
+            Err(StatusCode::SSH_FX_BAD_MESSAGE)
+        }
+    }
+}
+
+/// Sends a `SSH_FXP_VERSION` announcing extensions.
+///
+/// Encoded by hand since the pairs vary.
+async fn send_version_extensions<W: Write>(
+    output_producer: &mut SftpOutputProducer<'_, W>,
+    ext: Extensions,
+) -> SftpResult<()> {
+    let (mut sink, w) = output_producer.sink();
+    let len = 1 // packet type
+        + 4 // version
+        + ext.encoded_len();
+    let len: u32 = len.try_into().map_err(|_| sunset::error::NoRoom.build())?;
+
+    // The length field is encoded explicitly, sink.send() skips the
+    // sink's own.
+    len.enc(&mut sink)?;
+    u8::from(SftpNum::SSH_FXP_VERSION).enc(&mut sink)?;
+    SFTP_VERSION.enc(&mut sink)?;
+    ext.enc_pairs(&mut sink)?;
+    sink.send(w).await?;
+    Ok(())
 }
 
 /// Sends a `SSH_FXP_STATUS` reply for an operation with no other result.

@@ -1,5 +1,5 @@
 use crate::error::{SftpError, SftpResult};
-use crate::proto::{Attrs, OpaqueHandle, StatusCode};
+use crate::proto::{Attrs, Extensions, OpaqueHandle, StatusCode};
 use crate::proto::{NameEntry, PFlags};
 use crate::server::{DirReadHeaderReply, DirReadReplyFinished};
 use crate::sftpserver::{ReadHeaderReply, ReadReplyFinished};
@@ -464,6 +464,74 @@ pub trait SftpServer {
                 link_path = {:?}",
                 target_path,
                 link_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Extensions to announce to clients.
+    ///
+    /// Only announce what is implemented. Of these,
+    /// [`SftpServerHandler`](crate::SftpServerHandler) dispatches
+    /// `posix_rename`, `hardlink` and `fsync` to the methods below;
+    /// any other extended request is answered with
+    /// `SSH_FX_OP_UNSUPPORTED`.
+    fn extensions(&self) -> Extensions {
+        Extensions::default()
+    }
+
+    /// Renames a file, replacing `new_path` if it exists.
+    ///
+    /// The `posix-rename@openssh.com` extension. Only reached if
+    /// [`extensions()`](Self::extensions) announces it.
+    fn posix_rename(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer PosixRename operation not defined: old_path = {:?}, \
+                new_path = {:?}",
+                old_path,
+                new_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Creates a hard link at `new_path` pointing at `old_path`.
+    ///
+    /// The `hardlink@openssh.com` extension. Only reached if
+    /// [`extensions()`](Self::extensions) announces it.
+    fn hardlink(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer Hardlink operation not defined: old_path = {:?}, \
+                new_path = {:?}",
+                old_path,
+                new_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Flushes an open file to storage.
+    ///
+    /// The `fsync@openssh.com` extension. Only reached if
+    /// [`extensions()`](Self::extensions) announces it.
+    fn fsync(
+        &mut self,
+        handle: FileHandle,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer Fsync operation not defined: handle = {:?}",
+                handle
             );
             Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
         }
