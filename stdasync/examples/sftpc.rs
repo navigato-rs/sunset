@@ -22,6 +22,7 @@ use tokio::net::TcpStream;
 use sunset::{Error, SignKey};
 use sunset_async::{ChanInOut, SSHClient};
 use sunset_sftp::client::SftpClient;
+use sunset_sftp::embedded_io_async::{Read, Write};
 use sunset_sftp::error::SftpError;
 use sunset_sftp::protocol::Attrs;
 use sunset_stdasync::{AgentClient, CmdlineClient};
@@ -225,14 +226,10 @@ Commands:
   readlink PATH          show a symlink's target
   realpath PATH          canonicalise a path";
 
-async fn run_command<R, W, const N: usize>(
+async fn run_command<R: Read, W: Write, const N: usize>(
     client: &mut SftpClient<R, W, N>,
     cmd: &Command,
-) -> Result<()>
-where
-    R: sunset_sftp::embedded_io_async::Read,
-    W: sunset_sftp::embedded_io_async::Write,
-{
+) -> Result<()> {
     match cmd {
         Command::List { path } => list(client, path).await,
         Command::Get { remote, local } => get(client, remote, local).await,
@@ -300,68 +297,40 @@ where
     }
 }
 
-async fn list<R, W, const N: usize>(
+async fn list<R: Read, W: Write, const N: usize>(
     client: &mut SftpClient<R, W, N>,
     path: &str,
-) -> Result<()>
-where
-    R: sunset_sftp::embedded_io_async::Read,
-    W: sunset_sftp::embedded_io_async::Write,
-{
+) -> Result<()> {
     let dir =
         client.opendir(path).await.with_context(|| format!("opening {path}"))?;
 
-    let mut listed = Ok(());
-    'outer: loop {
-        match client.readdir(&dir).await {
-            Ok(None) => break,
-            Ok(Some(mut entries)) => {
-                loop {
-                    match entries.next().await {
-                        Ok(None) => break,
-                        Ok(Some(e)) => {
-                            // The long name is a server formatted "ls -l"
-                            // line. Fall back to just the name.
-                            if e.longname().is_empty() {
-                                println!(
-                                    "{}",
-                                    String::from_utf8_lossy(e.filename())
-                                );
-                            } else {
-                                println!(
-                                    "{}",
-                                    String::from_utf8_lossy(e.longname())
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            listed = Err(e).context("reading directory entry");
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                listed = Err(e).context("reading directory");
-                break;
+    let listed = async {
+        while let Some(mut entries) = client.readdir(&dir).await? {
+            while let Some(e) = entries.next().await? {
+                // The long name is a server formatted "ls -l" line.
+                // Fall back to just the name.
+                let line = match e.longname() {
+                    [] => e.filename(),
+                    l => l,
+                };
+                println!("{}", String::from_utf8_lossy(line));
             }
         }
+        Ok::<_, SftpError>(())
     }
+    .await
+    .with_context(|| format!("listing {path}"));
 
     // Close the handle even after a failure, the listing may be partial
     let closed = client.close(&dir).await.context("closing directory");
     listed.and(closed)
 }
 
-async fn get<R, W, const N: usize>(
+async fn get<R: Read, W: Write, const N: usize>(
     client: &mut SftpClient<R, W, N>,
     remote: &str,
     local: &str,
-) -> Result<()>
-where
-    R: sunset_sftp::embedded_io_async::Read,
-    W: sunset_sftp::embedded_io_async::Write,
-{
+) -> Result<()> {
     let h = client
         .open_read(remote)
         .await
@@ -394,15 +363,11 @@ where
     r.and(closed)
 }
 
-async fn put<R, W, const N: usize>(
+async fn put<R: Read, W: Write, const N: usize>(
     client: &mut SftpClient<R, W, N>,
     local: &str,
     remote: &str,
-) -> Result<()>
-where
-    R: sunset_sftp::embedded_io_async::Read,
-    W: sunset_sftp::embedded_io_async::Write,
-{
+) -> Result<()> {
     let mut input = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("opening {local}"))?;
@@ -431,52 +396,6 @@ where
 
     let closed = client.close(&h).await.context("closing remote file");
     r.and(closed)
-}
-
-/// `SftpError` doesn't implement `std::error::Error`, so it can't be
-/// used with `?` and `context()` directly.
-trait SftpContext<T> {
-    fn with_context<C, F>(self, f: F) -> Result<T>
-    where
-        C: std::fmt::Display + Send + Sync + 'static,
-        F: FnOnce() -> C;
-    fn context<C>(self, c: C) -> Result<T>
-    where
-        C: std::fmt::Display + Send + Sync + 'static;
-}
-
-impl<T> SftpContext<T> for Result<T, SftpError> {
-    fn with_context<C, F>(self, f: F) -> Result<T>
-    where
-        C: std::fmt::Display + Send + Sync + 'static,
-        F: FnOnce() -> C,
-    {
-        self.map_err(|e| anyhow!("{}: {}", f(), describe(&e)))
-    }
-
-    fn context<C>(self, c: C) -> Result<T>
-    where
-        C: std::fmt::Display + Send + Sync + 'static,
-    {
-        self.map_err(|e| anyhow!("{}: {}", c, describe(&e)))
-    }
-}
-
-/// A readable description of a SFTP failure.
-fn describe(e: &SftpError) -> String {
-    use sunset_sftp::protocol::StatusCode;
-    match e {
-        SftpError::FileServerError(s) => match s {
-            StatusCode::SSH_FX_NO_SUCH_FILE => "no such file".into(),
-            StatusCode::SSH_FX_PERMISSION_DENIED => "permission denied".into(),
-            StatusCode::SSH_FX_OP_UNSUPPORTED => {
-                "not supported by the server".into()
-            }
-            StatusCode::SSH_FX_EOF => "unexpected end of file".into(),
-            s => format!("server error {s:?}"),
-        },
-        e => format!("{e:?}"),
-    }
 }
 
 #[derive(argh::FromArgs, Debug)]
