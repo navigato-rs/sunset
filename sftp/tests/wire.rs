@@ -8,8 +8,9 @@ use common::pipe::{self, Pipe, run_test};
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
-use sunset_sftp::client::{self, SftpClient};
+use sunset_sftp::client::{self, RemoteHandle, SftpClient};
 use sunset_sftp::error::SftpError;
+use sunset_sftp::protocol::StatusCode;
 
 type Client =
     SftpClient<pipe::PipeReader, pipe::PipeWriter, { client::DEFAULT_CLIENT_BUF }>;
@@ -169,27 +170,207 @@ fn mismatched_request_id_is_rejected() {
     assert!(matches!(run_test(client.remove("/a")), Err(SftpError::BadResponse)));
 }
 
-#[test]
-fn read_requests_are_capped() {
-    let (s, mut client) = Scripted::new(&[]);
-    // Handle for a file
+/// Opens a file, returning the handle and discarding what was sent.
+fn open_file(s: &Scripted, client: &mut Client) -> RemoteHandle {
     let mut handle_body = vec![102u8];
     handle_body.extend_from_slice(&1u32.to_be_bytes());
     handle_body.extend_from_slice(&string(b"abcd"));
     s.to_client.push(&packet(handle_body));
-    s.to_client.push(&data_packet(2, b"hi"));
 
     let h = run_test(client.open_read("/f")).expect("open");
     let _ = s.from_client.take();
+    h
+}
 
-    let mut buf = vec![0u8; 100_000];
+/// Pulls the (id, offset, len) out of each `SSH_FXP_READ` sent.
+fn sent_reads(sent: &[u8]) -> Vec<(u32, u64, u32)> {
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p < sent.len() {
+        let len = u32::from_be_bytes(sent[p..p + 4].try_into().unwrap()) as usize;
+        let body = &sent[p + 4..p + 4 + len];
+        assert_eq!(body[0], 5, "expected SSH_FXP_READ");
+        let id = u32::from_be_bytes(body[1..5].try_into().unwrap());
+        // handle string
+        let hlen = u32::from_be_bytes(body[5..9].try_into().unwrap()) as usize;
+        let rest = &body[9 + hlen..];
+        let offset = u64::from_be_bytes(rest[..8].try_into().unwrap());
+        let want = u32::from_be_bytes(rest[8..12].try_into().unwrap());
+        out.push((id, offset, want));
+        p += 4 + len;
+    }
+    out
+}
+
+/// A read larger than `MAX_READ_LEN` is split, and the requests are all
+/// sent before their replies are read.
+///
+/// The replies are queued in reverse, which only works if the client
+/// has more than one request outstanding and matches replies by id.
+#[test]
+fn reads_are_chunked_pipelined_and_unordered() {
+    let (s, mut client) = Scripted::new(&[]);
+    let h = open_file(&s, &mut client);
+
+    let chunk = client::MAX_READ_LEN as usize;
+    let tail = 1000;
+    let total = 2 * chunk + tail;
+
+    // open() was request 1, so the reads are 2, 3 and 4
+    s.to_client.push(&data_packet(4, &vec![0xcc; tail]));
+    s.to_client.push(&data_packet(3, &vec![0xbb; chunk]));
+    s.to_client.push(&data_packet(2, &vec![0xaa; chunk]));
+
+    let mut buf = vec![0u8; total];
     let n = run_test(client.read(&h, 0, &mut buf)).expect("read");
-    assert_eq!(&buf[..n], b"hi");
 
-    // type(1) id(4) handle(4+4) offset(8) len(4)
+    assert_eq!(n, total);
+    assert!(buf[..chunk].iter().all(|b| *b == 0xaa));
+    assert!(buf[chunk..2 * chunk].iter().all(|b| *b == 0xbb));
+    assert!(buf[2 * chunk..].iter().all(|b| *b == 0xcc));
+
+    // No request asked for more than MAX_READ_LEN, and each covers its
+    // own part of the file.
+    let reads = sent_reads(&s.from_client.take());
+    assert_eq!(
+        reads,
+        [
+            (2, 0, chunk as u32),
+            (3, chunk as u64, chunk as u32),
+            (4, 2 * chunk as u64, tail as u32),
+        ]
+    );
+}
+
+/// The client fills its window before it waits for any reply.
+///
+/// Without that, each request would cost a round trip.
+#[test]
+fn the_pipeline_is_filled_before_waiting() {
+    let (s, mut client) = Scripted::new(&[]);
+    let h = open_file(&s, &mut client);
+    let chunk = client::MAX_READ_LEN as usize;
+
+    // No replies are queued, so the read gets as far as it can and then
+    // blocks. Whatever it sent first was sent without waiting.
+    let mut buf = vec![0u8; 20 * chunk];
+    {
+        let mut fut = pin!(client.read(&h, 0, &mut buf));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        // Dropped here, which leaves the client interrupted
+    }
+
+    let reads = sent_reads(&s.from_client.take());
+    assert_eq!(
+        reads.len(),
+        client::PIPELINE_DEPTH,
+        "the whole pipeline should be in flight"
+    );
+    // Covering consecutive parts of the file
+    for (i, (_, offset, len)) in reads.iter().enumerate() {
+        assert_eq!(*offset, (i * chunk) as u64);
+        assert_eq!(*len as usize, chunk);
+    }
+}
+
+/// A chunk that comes back short ends the contiguous data, whatever the
+/// later chunks returned.
+#[test]
+fn a_short_chunk_ends_the_read() {
+    let (s, mut client) = Scripted::new(&[]);
+    let h = open_file(&s, &mut client);
+
+    let chunk = client::MAX_READ_LEN as usize;
+    s.to_client.push(&data_packet(2, &vec![0xaa; chunk]));
+    // Short, so the third chunk's data is beyond a gap
+    s.to_client.push(&data_packet(3, &vec![0xbb; 100]));
+    s.to_client.push(&data_packet(4, &vec![0xcc; 500]));
+
+    let mut buf = vec![0u8; 2 * chunk + 500];
+    let n = run_test(client.read(&h, 0, &mut buf)).expect("read");
+    assert_eq!(n, chunk + 100);
+
+    // Reading on from there works normally. A buffer within one chunk
+    // makes a single request.
+    s.to_client.push(&status_packet(5, 1));
+    assert_eq!(
+        run_test(client.read(&h, n as u64, &mut buf[..100])).expect("read"),
+        0
+    );
+}
+
+/// End of file on the first chunk is a zero length read.
+#[test]
+fn eof_on_the_first_chunk() {
+    let (s, mut client) = Scripted::new(&[]);
+    let h = open_file(&s, &mut client);
+
+    let chunk = client::MAX_READ_LEN as usize;
+    // SSH_FX_EOF for the first, data for the second
+    s.to_client.push(&status_packet(2, 1));
+    s.to_client.push(&data_packet(3, &vec![0xbb; chunk]));
+
+    let mut buf = vec![0u8; 2 * chunk];
+    assert_eq!(run_test(client.read(&h, 0, &mut buf)).expect("read"), 0);
+}
+
+/// Writes longer than `MAX_WRITE_LEN` are split into several requests.
+#[test]
+fn writes_are_chunked_and_pipelined() {
+    let (s, mut client) = Scripted::new(&[]);
+    let h = open_file(&s, &mut client);
+
+    let chunk = client::MAX_WRITE_LEN as usize;
+    let data = vec![0x5a; chunk + 7];
+
+    // Replies in reverse, as for reads
+    s.to_client.push(&status_packet(3, 0));
+    s.to_client.push(&status_packet(2, 0));
+
+    run_test(client.write(&h, 64, &data)).expect("write");
+
+    // Two SSH_FXP_WRITE packets, at the right offsets
     let sent = s.from_client.take();
-    let len = u32::from_be_bytes(sent[sent.len() - 4..].try_into().unwrap());
-    assert_eq!(len, sunset_sftp::client::MAX_READ_LEN);
+    let mut p = 0;
+    let mut seen = Vec::new();
+    while p < sent.len() {
+        let len = u32::from_be_bytes(sent[p..p + 4].try_into().unwrap()) as usize;
+        let body = &sent[p + 4..p + 4 + len];
+        assert_eq!(body[0], 6, "expected SSH_FXP_WRITE");
+        let id = u32::from_be_bytes(body[1..5].try_into().unwrap());
+        let hlen = u32::from_be_bytes(body[5..9].try_into().unwrap()) as usize;
+        let rest = &body[9 + hlen..];
+        let offset = u64::from_be_bytes(rest[..8].try_into().unwrap());
+        let dlen = u32::from_be_bytes(rest[8..12].try_into().unwrap()) as usize;
+        assert_eq!(rest.len(), 12 + dlen, "data follows the header");
+        seen.push((id, offset, dlen));
+        p += 4 + len;
+    }
+    assert_eq!(seen, [(2, 64, chunk), (3, 64 + chunk as u64, 7)]);
+}
+
+/// A failure on one chunk of a write fails the whole write, and the
+/// remaining replies are consumed so the session survives.
+#[test]
+fn a_failed_write_chunk_fails_the_write() {
+    let (s, mut client) = Scripted::new(&[]);
+    let h = open_file(&s, &mut client);
+
+    let chunk = client::MAX_WRITE_LEN as usize;
+    s.to_client.push(&status_packet(2, 0));
+    // SSH_FX_PERMISSION_DENIED for the second chunk
+    s.to_client.push(&status_packet(3, 3));
+
+    let data = vec![0u8; chunk + 1];
+    match run_test(client.write(&h, 0, &data)) {
+        Err(SftpError::FileServerError(StatusCode::SSH_FX_PERMISSION_DENIED)) => (),
+        r => panic!("unexpected {r:?}"),
+    }
+
+    // Still usable
+    s.to_client.push(&status_packet(4, 0));
+    run_test(client.close(&h)).expect("close");
 }
 
 #[test]

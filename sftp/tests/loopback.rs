@@ -104,6 +104,31 @@ fn partial_reads_and_writes() {
 }
 
 #[test]
+fn pipelined_transfer() {
+    with_client(|mut client| async move {
+        // Several times MAX_WRITE_LEN, so the client splits the
+        // transfer and keeps requests in flight against our own server.
+        let len = 5 * sunset_sftp::client::MAX_WRITE_LEN as usize + 123;
+        let content: Vec<u8> = (0..len).map(|i| (i * 31) as u8).collect();
+
+        let h = client.create("/big").await?;
+        client.write(&h, 0, &content).await?;
+        client.close(&h).await?;
+        assert_eq!(client.stat("/big").await?.size, Some(len as u64));
+
+        let h = client.open_read("/big").await?;
+        let mut got = vec![0u8; len + 100];
+        let n = client.read(&h, 0, &mut got).await?;
+        assert_eq!(n, len);
+        assert_eq!(&got[..n], &content[..]);
+        // Reading from the end is still an EOF
+        assert_eq!(client.read(&h, len as u64, &mut got[..8]).await?, 0);
+        client.close(&h).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn read_offset() {
     with_client(|mut client| async move {
         let h = client.create("/f").await?;

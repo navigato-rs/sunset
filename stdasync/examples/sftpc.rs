@@ -32,9 +32,12 @@ use sunset_stdasync::{AgentClient, CmdlineClient};
 /// for embedded use, so that long paths and long names fit.
 const SFTP_BUF: usize = 8192;
 
-/// Chunk size for transfers. Servers commonly cap reads and writes at
-/// 32KiB, which is also `sunset_sftp::client::MAX_READ_LEN`.
-const CHUNK: usize = 32 * 1024;
+/// Chunk size for transfers.
+///
+/// The client splits this into `MAX_READ_LEN` sized requests and keeps
+/// several in flight, so a chunk covering the whole pipeline costs
+/// about one round trip rather than one per request.
+const CHUNK: usize = 256 * 1024;
 
 fn main() -> ExitCode {
     let args: Args = argh::from_env();
