@@ -25,9 +25,9 @@ A SSH client and server implementation. This is a fork of
 
   The [examples](stdasync/examples) include a Linux commandline SSH client `sunsetc`. It works as a day-to-day SSH client.
 
-- [`sunset-sftp`](sftp/) implements an SFTP server. An example of the application
-  side is in [demo/sftp/std](demo/sftp/std). `sunset-sftp` is currently under development,
-  treat as alpha status.
+- [`sunset-sftp`](sftp/) implements an SFTP server and client. An example of the
+  application side is in [demo/sftp/std](demo/sftp/std). `sunset-sftp` is currently
+  under development, treat as alpha status.
 
 ## SSH Features
 
@@ -44,14 +44,14 @@ Working:
 - ecdsa256
 - `~.` client escape sequences
 - Post quantum hybrid key exchange (mlkem)
-- SFTP server
+- SFTP server and client
 - Client `direct-tcpip` (local TCP forward, the channel behind `ssh -L` / `ssh -J`)
 - Agent-held `sk-ssh-ed25519@openssh.com` keys (signing stays in the agent)
 - Up to 16 concurrent channels
 
 Desirable:
 
-- SFTP client?
+- SFTP request pipelining, and a commandline SFTP client
 - sntrup761
 - Inbound / remote TCP forwarding (`forwarded-tcpip`)
 - A std server example

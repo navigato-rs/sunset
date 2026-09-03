@@ -1,21 +1,54 @@
 //! SFTP (SSH File Transfer Protocol) implementation for [`sunset`].
 //!
-//! (Partially) Implements SFTP v3 as defined in [draft-ietf-secsh-filexfer-02](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02).
+//! Implements SFTP v3 as defined in [draft-ietf-secsh-filexfer-02](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02).
 //!
-//! **Work in Progress**: Currently focuses on file upload operations.
-//! Long packets for requests other than writing and additional SFTP operations
-//! are not yet implemented. Please see the roadmap and use this crate carefully.
+//! **Work in Progress**: please see the roadmap and use this crate carefully.
 //!
-//! This crate implements a handler that, given `embedded_io_async` `Read`/`Write`,
-//! a `sunset_async::SSHServer`, and some auxiliary buffers,
-//! can dispatch SFTP packets to a struct implementing [`SftpServer`](sftpserver::SftpServer) trait.
+//! Both sides are `no_std` and allocation free. While designed for use
+//! with Sunset SSH, they should be usable with any transport that
+//! implements the `embedded_io_async` `Read`/`Write` traits.
 //!
-//! At present only server functionality is implemented, client handling may
-//! be added later. While designed for use with Sunset SSH, it should be
-//! usable with any transport that implements `embedded_io_async` traits.
+//! # Server
 //!
-//! See example usage in the `../demo/sftd/std` directory for the intended usage
-//! of this library.
+//! [`SftpServerHandler`] dispatches SFTP packets to a struct implementing
+//! the [`SftpServer`](server::SftpServer) trait, which the application
+//! provides to describe its filesystem.
+//!
+//! See example usage in the `../demo/sftp/std` directory.
+//!
+//! # Client
+//!
+//! [`SftpClient`](client::SftpClient) makes requests over a SSH channel
+//! that has had the `sftp` subsystem started on it. With `sunset-async`
+//! that is a client session channel opened with
+//! `SSHClient::open_session_nopty()`, with
+//! `SessionCommand::Subsystem("sftp")` requested on it.
+//!
+//! ```
+//! use sunset_sftp::client::SftpClient;
+//! use sunset_sftp::embedded_io_async::{Read, Write};
+//! use sunset_sftp::error::SftpResult;
+//!
+//! // chan_in and chan_out are the two halves of the SFTP channel.
+//! async fn upload(
+//!     chan_in: impl Read,
+//!     chan_out: impl Write,
+//!     data: &[u8],
+//! ) -> SftpResult<()> {
+//!     let mut client = SftpClient::new_default_buffer(chan_in, chan_out);
+//!     client.init().await?;
+//!
+//!     let f = client.create("/tmp/hello").await?;
+//!     for (i, chunk) in data.chunks(4096).enumerate() {
+//!         client.write(&f, (i * 4096) as u64, chunk).await?;
+//!     }
+//!     client.close(&f).await
+//! }
+//! ```
+//!
+//! File contents and directory listings are streamed, so transfers
+//! aren't limited by the client's buffer size. Requests are made one at
+//! a time, without pipelining.
 //!
 //! # Roadmap
 //!
@@ -35,19 +68,26 @@
 //!
 //! ## Minimal features for convenient usability
 //!
-//! - [ ] [Removing files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5)
-//! - [ ] [Renaming files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5)
-//! - [ ] [Creating directories](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6)
-//! - [ ] [Removing directories](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6)
+//! - [x] [Removing files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5)
+//! - [x] [Renaming files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5)
+//! - [x] [Creating directories](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6)
+//! - [x] [Removing directories](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6)
 //!
 //! ## Extended features
 //!
-//! - [ ] [Append, create and truncate files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.3)
-//! - [ ] [Reading](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.8) files attributes
-//! - [ ] [Setting](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.9) files attributes
-//! - [ ] [Dealing with Symbolic links](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.10)
+//! - [x] [Append, create and truncate files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.3)
+//! - [x] [Reading](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.8) files attributes
+//! - [x] [Setting](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.9) files attributes
+//! - [x] [Dealing with Symbolic links](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.10)
 //! - [ ] [Vendor Specific](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-8)
-//!   request and responses
+//!   request and responses. The client sends the `posix-rename`,
+//!   `hardlink` and `fsync` OpenSSH extensions, the server answers
+//!   `SSH_FXP_EXTENDED` with `SSH_FX_OP_UNSUPPORTED`.
+//!
+//! ## Client
+//!
+//! - [ ] Pipelining requests, to avoid a round trip per block transferred
+//! - [ ] A commandline SFTP client, like `sunsetc` for shell sessions
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -57,6 +97,7 @@
 #![allow(clippy::collapsible_if)]
 
 mod proto;
+mod sftpclient;
 mod sftperror;
 mod sftphandler;
 mod sftpserver;
@@ -95,6 +136,18 @@ pub mod server {
     pub use crate::proto::MAX_REQUEST_LEN;
 }
 
+/// SFTP client
+///
+/// [`SftpClient`](client::SftpClient) drives a SFTP session over a SSH
+/// channel that has had the `sftp` subsystem started on it.
+pub mod client {
+    pub use crate::sftpclient::{
+        DEFAULT_CLIENT_BUF, Extensions, MAX_READ_LEN, RemoteHandle, SftpClient,
+        pflags,
+    };
+    pub use crate::sftpclient::{DirEntry, DirIter};
+}
+
 /// SFTP Protocol types and structures
 pub mod protocol {
     pub use crate::proto::Attrs;
@@ -108,9 +161,11 @@ pub mod protocol {
     pub use crate::proto::StatusCode;
     /// Constants that might be useful for SFTP developers
     pub mod constants {
+        pub use crate::proto::MAX_HANDLE_LEN;
         pub use crate::proto::MAX_NAME_ENTRY_SIZE;
         pub use crate::proto::MAX_PATH_LEN;
         pub use crate::proto::SFTP_FIELD_LEN_LENGTH;
+        pub use crate::proto::SFTP_VERSION;
     }
 }
 
