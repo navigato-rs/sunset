@@ -26,13 +26,23 @@ where
 }
 
 /// Runs `f` with a client connected to `fs`.
-fn with_server<F, Fut>(mut fs: MemFs, f: F)
+fn with_server<F, Fut>(fs: MemFs, f: F)
 where
     F: FnOnce(Client) -> Fut,
     Fut: Future<Output = Result<(), SftpError>>,
 {
-    let c2s = Pipe::new();
-    let s2c = Pipe::new();
+    with_bounded_server(fs, usize::MAX, f)
+}
+
+/// Runs `f` with a connection that makes writers wait once `capacity`
+/// bytes are unread, as a SSH channel window does.
+fn with_bounded_server<F, Fut>(mut fs: MemFs, capacity: usize, f: F)
+where
+    F: FnOnce(Client) -> Fut,
+    Fut: Future<Output = Result<(), SftpError>>,
+{
+    let c2s = Pipe::bounded(capacity);
+    let s2c = Pipe::bounded(capacity);
 
     let mut handler = SftpServerHandler::default();
 
@@ -134,6 +144,62 @@ fn pipelined_transfer() {
         client.close(&h).await?;
         Ok(())
     })
+}
+
+/// A transfer over a connection that can't absorb it all at once.
+///
+/// Both sides have to keep making progress when a write blocks partway
+/// rather than completing immediately, which is the normal case on a
+/// real connection but never happens with the other tests here.
+///
+/// This doesn't reproduce SSH's own flow control, where unread channel
+/// data stops a peer processing the window adjustment it is waiting
+/// for. That needs a real channel, and is what the deadlocks noted in
+/// the changelog were.
+#[test]
+fn transfer_over_a_narrow_connection() {
+    // Comparable to Sunset's default channel window
+    const CAPACITY: usize = 1000;
+
+    let c2s = Pipe::bounded(CAPACITY);
+    let s2c = Pipe::bounded(CAPACITY);
+    let c2s_stalls = c2s.clone();
+
+    let mut handler = SftpServerHandler::default();
+    let mut fs = MemFs::new();
+    let server = handler.run(&mut fs, c2s.reader(), s2c.writer());
+
+    let mut client: Client = SftpClient::new(s2c.reader(), c2s.writer());
+    let body = async {
+        client.init().await?;
+
+        // Several chunks each way, more than one pipeline of reads
+        let len = 3 * sunset_sftp::client::MAX_WRITE_LEN as usize + 77;
+        let content: Vec<u8> = (0..len).map(|i| (i * 13) as u8).collect();
+
+        let h = client.create("/f").await?;
+        client.write(&h, 0, &content).await?;
+        client.close(&h).await?;
+
+        let h = client.open_read("/f").await?;
+        let mut got = vec![0u8; len];
+        let n = client.read(&h, 0, &mut got).await?;
+        client.close(&h).await?;
+
+        assert_eq!(n, len);
+        assert_eq!(got, content);
+        Ok::<_, SftpError>(())
+    };
+
+    match run_test(select(server, body)) {
+        Either::First(r) => panic!("server exited early: {r:?}"),
+        Either::Second(r) => r.expect("transfer failed"),
+    }
+
+    assert!(
+        c2s_stalls.stalls() > 0,
+        "the connection should have filled up, otherwise this proves nothing"
+    );
 }
 
 #[test]

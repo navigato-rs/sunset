@@ -11,10 +11,20 @@ use std::rc::Rc;
 use sunset_sftp::embedded_io_async::{ErrorType, Read, Write};
 use sunset_sftp::sunset;
 
-#[derive(Default)]
 struct Inner {
     buf: VecDeque<u8>,
     closed: bool,
+    /// How much may be buffered before a writer has to wait
+    capacity: usize,
+    /// Times a writer found it full, so the test can check it was
+    /// actually exercised
+    stalls: usize,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self { buf: VecDeque::new(), closed: false, capacity: usize::MAX, stalls: 0 }
+    }
 }
 
 /// One direction of a connection.
@@ -24,6 +34,22 @@ pub struct Pipe(Rc<RefCell<Inner>>);
 impl Pipe {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A pipe that makes writers wait once `capacity` bytes are
+    /// unread, the way a SSH channel window does.
+    ///
+    /// Without this a peer can always write, which hides deadlocks
+    /// where neither side reads because both are busy writing.
+    pub fn bounded(capacity: usize) -> Self {
+        let p = Self::default();
+        p.0.borrow_mut().capacity = capacity;
+        p
+    }
+
+    /// Times a writer had to wait for the reader.
+    pub fn stalls(&self) -> usize {
+        self.0.borrow().stalls
     }
 
     pub fn reader(&self) -> PipeReader {
@@ -87,8 +113,19 @@ impl Write for PipeWriter {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.0.borrow_mut().buf.extend(buf);
-        Ok(buf.len())
+        poll_fn(|_cx| {
+            let mut inner = self.0.borrow_mut();
+            let space = inner.capacity.saturating_sub(inner.buf.len());
+            if space == 0 {
+                inner.stalls += 1;
+                // run_test() polls in a loop, so no waker is needed.
+                return Poll::Pending;
+            }
+            let l = buf.len().min(space);
+            inner.buf.extend(&buf[..l]);
+            Poll::Ready(Ok(l))
+        })
+        .await
     }
 
     async fn flush(&mut self) -> Result<(), sunset::Error> {
