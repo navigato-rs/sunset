@@ -1,9 +1,10 @@
 # Sunset SSH
 
-A SSH client and server implementation. It is intended to be very flexible to
-embed pretty much anywhere, I'm collecting possible use cases in
-[discussions](https://github.com/mkj/sunset/discussions/1). Don't hesitate to
-suggest something!
+A SSH client and server implementation. This is a fork of
+[mkj/sunset](https://github.com/mkj/sunset), maintained under
+[navigato-rs](https://github.com/navigato-rs) for
+[FileMan](https://github.com/navigato-rs/fileman) and
+[Starcom](https://github.com/navigato-rs/starcom).
 
 - `sunset` (this toplevel) is the core SSH implementation. It provides a
   non-async API, runs with `no_std` and no alloc.
@@ -44,19 +45,18 @@ Working:
 - `~.` client escape sequences
 - Post quantum hybrid key exchange (mlkem)
 - SFTP server
+- Client `direct-tcpip` (local TCP forward, the channel behind `ssh -L` / `ssh -J`)
+- Agent-held `sk-ssh-ed25519@openssh.com` keys (signing stays in the agent)
+- Up to 16 concurrent channels
 
 Desirable:
 
 - SFTP client?
 - sntrup761
-- TCP forwarding
+- Inbound / remote TCP forwarding (`forwarded-tcpip`)
 - A std server example
 - Perhaps aes256-gcm
-
-## Rust versions
-
-At the time of writing Sunset will build with Rust 1.95.
-The requirement may increase whenever useful, targetting stable.
+- Keyboard-interactive and certificates
 
 ## Checks
 
@@ -72,7 +72,8 @@ will not be cleared.
 
 ## Author
 
-Matt Johnston <matt@ucc.asn.au>
+Originally written by Matt Johnston <matt@ucc.asn.au>.
+This fork is developed mostly by LLMs, to serve FileMan and Starcom.
 
 It's built on top of lots of other work, particularly Embassy, the rust-crypto crates,
 Virtue, smoltcp, and Salty.
