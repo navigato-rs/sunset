@@ -156,7 +156,12 @@ impl CmdlineClient {
                 let mut buf = [0u8; 1000];
                 let l = si.read(&mut buf).await.map_err(|_| Error::ChannelEOF)?;
                 if l == 0 {
-                    return Err(Error::ChannelEOF);
+                    // Local input ended. Tell the peer rather than
+                    // tearing down: a command reading stdin needs to
+                    // see it end, and we still want its output.
+                    debug!("stdin EOF, sending channel EOF");
+                    stdin.send_eof().await?;
+                    return Ok(());
                 }
 
                 let buf = &buf[..l];

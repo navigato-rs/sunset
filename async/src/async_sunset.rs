@@ -507,6 +507,8 @@ pub(crate) trait ChanCore: MaybeSend {
         buf: &[u8],
     ) -> Poll<Result<usize>>;
 
+    fn poll_send_eof(&self, cx: &mut Context, num: ChanNum) -> Poll<Result<()>>;
+
     // Client only
     fn poll_term_window_change(
         &self,
@@ -642,6 +644,21 @@ impl<'a, CS: CliServ> ChanCore for AsyncSunset<'a, CS> {
             self.wake_progress();
             Poll::Ready(l)
         }
+    }
+
+    fn poll_send_eof(&self, cx: &mut Context, num: ChanNum) -> Poll<Result<()>> {
+        // Attempt to lock .inner
+        let i = self.inner.lock();
+        let i = pin!(i);
+        let Ready(mut inner) = i.poll(cx) else {
+            return Pending;
+        };
+        let (runner, h) = inner.fetch(num)?;
+        let r = runner.send_channel_eof(h);
+        if r.is_ok() {
+            self.wake_progress();
+        }
+        Poll::Ready(r)
     }
 
     fn poll_term_window_change(

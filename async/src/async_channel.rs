@@ -49,6 +49,10 @@ impl ChanIO<'_> {
         poll_fn(|cx| self.sunset.poll_until_channel_closed(cx, self.num)).await
     }
 
+    pub async fn send_eof(&self) -> Result<()> {
+        poll_fn(|cx| self.sunset.poll_send_eof(cx, self.num)).await
+    }
+
     pub async fn term_window_change(
         &self,
         winch: sunset::packets::WinChange,
@@ -182,6 +186,17 @@ impl<'g> ChanOut<'g> {
         self.0.until_closed().await
     }
 
+    /// Tells the peer that no more data will be sent on this channel.
+    ///
+    /// The channel stays open for reading, so a remote command sees its
+    /// standard input end while still being able to reply and exit.
+    /// `tar xf -` or `cat > file` need this to finish.
+    ///
+    /// Later writes fail with [`ChannelEOF`](sunset::Error::ChannelEOF).
+    pub async fn send_eof(&self) -> Result<()> {
+        self.0.send_eof().await
+    }
+
     /// Send a terminal size change notification
     ///
     /// Only applicable to client shell channels with a PTY
@@ -241,6 +256,17 @@ impl<'g> ChanInOut<'g> {
     /// Wait until the channel closes.
     pub async fn until_closed(&self) -> Result<()> {
         self.0.until_closed().await
+    }
+
+    /// Tells the peer that no more data will be sent on this channel.
+    ///
+    /// The channel stays open for reading, so a remote command sees its
+    /// standard input end while still being able to reply and exit.
+    /// `tar xf -` or `cat > file` need this to finish.
+    ///
+    /// Later writes fail with [`ChannelEOF`](sunset::Error::ChannelEOF).
+    pub async fn send_eof(&self) -> Result<()> {
+        self.0.send_eof().await
     }
 
     /// Send a terminal size change notification
