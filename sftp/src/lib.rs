@@ -86,8 +86,8 @@
 //!
 //! ## Client
 //!
+//! - [x] A commandline SFTP client, `sftpc` in `sunset-stdasync`
 //! - [ ] Pipelining requests, to avoid a round trip per block transferred
-//! - [ ] A commandline SFTP client, like `sunsetc` for shell sessions
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

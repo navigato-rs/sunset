@@ -47,4 +47,5 @@ simplelog = "0.12"
 time = { version = "0.3", features = ["local-offset"] }
 
 sunset-async = { workspace = true, features = ["multi-thread", "std", "tokio"] }
+sunset-sftp.workspace = true
 critical-section = { version = "1.1", features = ["std"] }

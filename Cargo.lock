@@ -3239,6 +3239,7 @@ dependencies = [
  "ssh-key",
  "sunset",
  "sunset-async",
+ "sunset-sftp",
  "sunset-sshwire-derive",
  "time",
  "tokio",

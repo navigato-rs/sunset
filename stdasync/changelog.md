@@ -1,5 +1,22 @@
 # `sunset-stdasync` Changelog
 
+## Unreleased
+
+### Added
+
+- `CmdlineClient::run_channel()` runs a session like `run()` does, but
+  hands the channel to a caller supplied closure rather than connecting
+  it to the terminal. For subsystems such as SFTP.
+
+- `sftpc` example, a commandline SFTP client built on `sunset-sftp`.
+
+### Fixed
+
+- `sunsetc` sets `TCP_NODELAY`, as OpenSSH does. Without it Nagle held
+  each small packet back until the peer's delayed ACK, adding tens of
+  milliseconds to every keystroke and to every request of a
+  request/response protocol over the connection.
+
 ## 0.6.0 - 2026-08-02
 
 ### Changed
