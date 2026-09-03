@@ -4,12 +4,13 @@ use core::task::{Poll, Waker};
 
 use crate::error::SftpError;
 use crate::proto::{
-    self, InitVersionClient, InitVersionLowest, LStat, MAX_REQUEST_LEN, ReqId,
-    SFTP_VERSION, SftpPacket, Stat, StatusCode,
+    self, InitVersionClient, InitVersionLowest, LStat, MAX_REQUEST_LEN, NameEntry,
+    ReqId, SFTP_VERSION, SftpPacket, Stat, StatusCode,
 };
 use crate::server::DirReadHeaderReply;
 use crate::sftperror::SftpResult;
 use crate::sftphandler::sftpoutputchannelhandler::SftpOutputProducer;
+use crate::sftpserver::SftpOpResult;
 use crate::sftpserver::{DirHandle, FileHandle, ReadHeaderReply, SftpServer};
 use crate::sftpserver::{FileOrDirHandle, decode_opaque_handle};
 use crate::sftpsource::{SftpDecoded, SftpSource};
@@ -388,10 +389,8 @@ where
                         output_producer.send_packet(&response).await?;
                     }
                     Err(status_code) => {
-                        error!("Open failed: {:?}", status_code);
-                        output_producer
-                            .send_status(req_id, StatusCode::SSH_FX_FAILURE, "")
-                            .await?;
+                        error!("OpenDir failed: {:?}", status_code);
+                        output_producer.send_status(req_id, status_code, "").await?;
                     }
                 };
             }
@@ -417,11 +416,7 @@ where
                     Err(e) => {
                         error!("SFTP Close thrown: {:?}", e);
                         output_producer
-                            .send_status(
-                                req_id,
-                                StatusCode::SSH_FX_FAILURE,
-                                "Could not Close the handle",
-                            )
+                            .send_status(req_id, e, "Could not Close the handle")
                             .await?;
                     }
                 }
@@ -464,37 +459,97 @@ where
                     }
                     Err(status_code) => {
                         error!("Open failed: {:?}", status_code);
-                        output_producer
-                            .send_status(req_id, StatusCode::SSH_FX_FAILURE, "")
-                            .await?;
+                        output_producer.send_status(req_id, status_code, "").await?;
                     }
                 };
             }
             SftpPacket::PathInfo(req_id, path_info) => {
-                match self.file_server.realpath(path_info.path.to_str()?).await {
-                    Ok(name_entry) => {
-                        let dir_read_header_reply =
-                            DirReadHeaderReply::new(req_id, output_producer);
-                        let encoded_len =
-                            crate::sftpserver::helpers::get_name_entry_len(
-                                &name_entry,
-                            )?;
-                        debug!("PathInfo encoded length: {:?}", encoded_len);
-                        trace!("PathInfo Response content: {:?}", encoded_len);
-                        let dir_read_data_reply = dir_read_header_reply
-                            .send_header(encoded_len, 1)
-                            .await?;
-                        dir_read_data_reply
-                            .send_data(|mut sender| async move {
-                                sender.send_item(&name_entry).await?;
-                                sender.completed().trap().map_err(|e| e.into())
-                            })
+                let res = self.file_server.realpath(path_info.path.to_str()?).await;
+                send_name_response(output_producer, req_id, res).await?;
+            }
+            SftpPacket::ReadLink(req_id, readlink) => {
+                let res =
+                    self.file_server.readlink(readlink.file_path.to_str()?).await;
+                send_name_response(output_producer, req_id, res).await?;
+            }
+            SftpPacket::FStat(req_id, fstat) => {
+                let res = match decode_opaque_handle(fstat.handle) {
+                    Ok(FileOrDirHandle::File(h)) => self.file_server.fattrs(h).await,
+                    // FSTAT of a directory handle isn't useful, and the
+                    // SftpServer trait has no method for it.
+                    Ok(FileOrDirHandle::Dir(_)) => {
+                        Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+                    }
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(attrs) => {
+                        output_producer
+                            .send_packet(&SftpPacket::Attrs(req_id, attrs))
                             .await?;
                     }
-                    Err(code) => {
-                        output_producer.send_status(req_id, code, "").await?;
+                    Err(status) => {
+                        output_producer
+                            .send_status(req_id, status, "Could not list attributes")
+                            .await?;
                     }
                 }
+            }
+            SftpPacket::SetStat(req_id, setstat) => {
+                let res = self
+                    .file_server
+                    .set_attrs(setstat.file_path.to_str()?, &setstat.attrs)
+                    .await;
+                send_op_status(output_producer, req_id, res, "SetStat failed")
+                    .await?;
+            }
+            SftpPacket::FSetStat(req_id, fsetstat) => {
+                let res = match decode_opaque_handle(fsetstat.handle) {
+                    Ok(FileOrDirHandle::File(h)) => {
+                        self.file_server.set_fattrs(h, &fsetstat.attrs).await
+                    }
+                    Ok(FileOrDirHandle::Dir(_)) => {
+                        Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+                    }
+                    Err(e) => Err(e),
+                };
+                send_op_status(output_producer, req_id, res, "FSetStat failed")
+                    .await?;
+            }
+            SftpPacket::Remove(req_id, remove) => {
+                let res = self.file_server.remove(remove.file_path.to_str()?).await;
+                send_op_status(output_producer, req_id, res, "Remove failed")
+                    .await?;
+            }
+            SftpPacket::MkDir(req_id, mkdir) => {
+                let res = self
+                    .file_server
+                    .mkdir(mkdir.dir_path.to_str()?, &mkdir.attrs)
+                    .await;
+                send_op_status(output_producer, req_id, res, "MkDir failed").await?;
+            }
+            SftpPacket::RmDir(req_id, rmdir) => {
+                let res = self.file_server.rmdir(rmdir.dir_path.to_str()?).await;
+                send_op_status(output_producer, req_id, res, "RmDir failed").await?;
+            }
+            SftpPacket::Rename(req_id, rename) => {
+                let res = self
+                    .file_server
+                    .rename(rename.old_path.to_str()?, rename.new_path.to_str()?)
+                    .await;
+                send_op_status(output_producer, req_id, res, "Rename failed")
+                    .await?;
+            }
+            SftpPacket::Symlink(req_id, symlink) => {
+                let res = self
+                    .file_server
+                    .symlink(
+                        symlink.target_path.to_str()?,
+                        symlink.link_path.to_str()?,
+                    )
+                    .await;
+                send_op_status(output_producer, req_id, res, "Symlink failed")
+                    .await?;
             }
             SftpPacket::Init(..)
             | SftpPacket::Version(..)
@@ -644,6 +699,52 @@ where
         }
 
         Ok(())
+    }
+}
+
+/// Sends a `SSH_FXP_STATUS` reply for an operation with no other result.
+async fn send_op_status<W: Write>(
+    output_producer: &mut SftpOutputProducer<'_, W>,
+    req_id: ReqId,
+    res: SftpOpResult<()>,
+    msg: &'static str,
+) -> SftpResult<()> {
+    match res {
+        Ok(()) => {
+            output_producer.send_status(req_id, StatusCode::SSH_FX_OK, "").await
+        }
+        Err(status) => {
+            error!("{}: {:?}", msg, status);
+            output_producer.send_status(req_id, status, msg).await
+        }
+    }
+}
+
+/// Sends a `SSH_FXP_NAME` reply holding a single entry.
+///
+/// Used for `SSH_FXP_REALPATH` and `SSH_FXP_READLINK`, which both
+/// return exactly one name.
+async fn send_name_response<W: Write>(
+    output_producer: &mut SftpOutputProducer<'_, W>,
+    req_id: ReqId,
+    res: SftpOpResult<NameEntry<'_>>,
+) -> SftpResult<()> {
+    match res {
+        Ok(name_entry) => {
+            let header = DirReadHeaderReply::new(req_id, output_producer);
+            let encoded_len =
+                crate::sftpserver::helpers::get_name_entry_len(&name_entry)?;
+            trace!("Name response encoded length: {:?}", encoded_len);
+            let data_reply = header.send_header(encoded_len, 1).await?;
+            data_reply
+                .send_data(|mut sender| async move {
+                    sender.send_item(&name_entry).await?;
+                    sender.completed().trap().map_err(|e| e.into())
+                })
+                .await?;
+            Ok(())
+        }
+        Err(code) => output_producer.send_status(req_id, code, "").await,
     }
 }
 

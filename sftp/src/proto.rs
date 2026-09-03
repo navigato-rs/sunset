@@ -39,10 +39,6 @@ pub const SFTP_FIELD_REQ_ID_INDEX: usize = 5;
 /// SFTP packets ID length is 1 byte
 pub const SFTP_FIELD_REQ_ID_LEN: usize = 4;
 
-/// Considering the definition in [Section 7](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-7)
-/// for handle maximum length
-pub const _SSH_FXP_HANDLE_MAX_LEN: u32 = 256;
-
 /// The maximum size for full paths is only limited by the u32 where ssh strings lengths are contained. This causes that
 /// different platforms use different maximum path lengths. We need to make a choice in this implementation.
 /// Since it is targeting embedded devices I am going to set it short, since influence the length of an internal buffer
@@ -54,16 +50,29 @@ pub const MAX_PATH_LEN: usize = 1024; // PATH_MAX for macOS
 #[cfg(feature = "long-paths-4096")]
 pub const MAX_PATH_LEN: usize = 4096; // Linux glibc PATH_MAX is typically 4096 bytes
 
-/// Maximum request size.
+/// Maximum request size, including the length field and packet header.
 ///
 /// This accounts for [MAX_PATH_LEN] (varying with crate features).
 /// Read/write packet payloads are not included in this size, they
 /// are handled independently.
 ///
-/// At this moment in time, the longest request is `SSH_FXP_OPEN`.
-pub const MAX_REQUEST_LEN: usize = 4 + MAX_PATH_LEN // Filename string
-                                + 4 // PFlags (u32)
-                                + 32; // Attrs (Max 32Bytes not counting extensions)
+/// The longest requests are `SSH_FXP_RENAME` and `SSH_FXP_SYMLINK`,
+/// which carry two paths.
+pub const MAX_REQUEST_LEN: usize = SFTP_MINIMUM_PACKET_LEN // length, type, req id
+                                + 2 * (4 + MAX_PATH_LEN); // Two path strings
+
+/// `SSH_FXP_EXTENDED` packet type.
+///
+/// Extended requests have a vendor specific payload so they aren't part
+/// of the [`SftpPacket`] enum, they are encoded directly.
+/// See [Vendor-Specific-Extensions](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-8).
+pub const SSH_FXP_EXTENDED: u8 = 200;
+
+/// Maximum length of a server provided file handle.
+///
+/// [Section 7](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-7)
+/// requires that servers do not send handles longer than 256 bytes.
+pub const MAX_HANDLE_LEN: usize = 256;
 
 /// Considering the definition in [Section 7](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-7)
 /// for `SSH_FXP_READDIR`
@@ -267,6 +276,92 @@ pub struct LStat<'a> {
 pub struct Stat<'a> {
     /// The path of the element which stats are to be retrieved
     pub file_path: TextString<'a>,
+}
+
+/// Used for `ssh_fxp_fstat` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.8).
+///
+/// Returns the attributes of an already open file or directory.
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct FStat<'a> {
+    /// An opaque handle that is used by the server to identify an open
+    /// file or folder.
+    pub handle: OpaqueHandle<'a>,
+}
+
+/// Used for `ssh_fxp_setstat` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.9).
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct SetStat<'a> {
+    /// The path of the element to modify
+    pub file_path: TextString<'a>,
+    /// The attributes to apply
+    pub attrs: Attrs,
+}
+
+/// Used for `ssh_fxp_fsetstat` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.9).
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct FSetStat<'a> {
+    /// An opaque handle that is used by the server to identify an open
+    /// file or folder.
+    pub handle: OpaqueHandle<'a>,
+    /// The attributes to apply
+    pub attrs: Attrs,
+}
+
+/// Used for `ssh_fxp_remove` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5).
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct Remove<'a> {
+    /// The path of the file to remove. Must not be a directory.
+    pub file_path: TextString<'a>,
+}
+
+/// Used for `ssh_fxp_mkdir` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6).
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct MkDir<'a> {
+    /// The path of the directory to create
+    pub dir_path: TextString<'a>,
+    /// Attributes for the new directory
+    pub attrs: Attrs,
+}
+
+/// Used for `ssh_fxp_rmdir` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6).
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct RmDir<'a> {
+    /// The path of the directory to remove
+    pub dir_path: TextString<'a>,
+}
+
+/// Used for `ssh_fxp_rename` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5).
+///
+/// The rename fails if `new_path` already exists.
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct Rename<'a> {
+    /// The existing path
+    pub old_path: TextString<'a>,
+    /// The new path, which must not already exist
+    pub new_path: TextString<'a>,
+}
+
+/// Used for `ssh_fxp_readlink` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.10).
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct ReadLink<'a> {
+    /// The path of the symbolic link to read
+    pub file_path: TextString<'a>,
+}
+
+/// Used for `ssh_fxp_symlink` [request](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.10).
+///
+/// Note the field order. draft-ietf-secsh-filexfer-02 specifies
+/// `linkpath` then `targetpath`, but the OpenSSH implementation
+/// reversed the two arguments and that ordering became the de-facto
+/// standard (see the "Reversal of arguments to SSH_FXP_SYMLINK" section
+/// of OpenSSH's `PROTOCOL` document). Sunset follows OpenSSH so that
+/// it interoperates with existing peers.
+#[derive(Debug, SSHEncode, SSHDecode)]
+pub struct Symlink<'a> {
+    /// Where the new symlink will point to
+    pub target_path: TextString<'a>,
+    /// The path of the symlink to create
+    pub link_path: TextString<'a>,
 }
 
 // ============================= Responses =============================
@@ -473,7 +568,7 @@ impl SSHEncode for StatusCode {
 /// See [File Attributes](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#autoid-5)
 /// for more information.
 #[allow(missing_docs)]
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Attrs {
     pub size: Option<u64>,
     pub uid: Option<u32>,
@@ -850,18 +945,15 @@ macro_rules! sftpmessages {
             /// Encode a request.
             ///
             /// Used by a SFTP client. Does not include the length field.
-            pub fn encode_request(&self, id: ReqId, s: &mut dyn SSHSink) -> SftpResult<()> {
+            ///
+            /// The request id is part of the `SftpPacket` variant.
+            /// Fails if the encoded SFTP Packet is not a request.
+            pub fn encode_request(&self, s: &mut dyn SSHSink) -> SftpResult<()> {
                 if !self.sftp_num().is_request() {
                     sunset::Error::bug()?;
                 }
 
-                // packet type
-                self.sftp_num().enc(s)?;
-                // request ID
-                id.0.enc(s)?;
-                // contents
-                self.enc(s)?;
-                Ok(())
+                Ok(self.enc(s)?)
             }
 
             /// Encode a response.
@@ -923,10 +1015,19 @@ sftpmessages! [
             (5, Read, Read<'a>, "ssh_fxp_read"),
             (6, Write, Write<'a>, "ssh_fxp_write"),
             (7, LStat, LStat<'a>, "ssh_fxp_lstat"),
+            (8, FStat, FStat<'a>, "ssh_fxp_fstat"),
+            (9, SetStat, SetStat<'a>, "ssh_fxp_setstat"),
+            (10, FSetStat, FSetStat<'a>, "ssh_fxp_fsetstat"),
             (11, OpenDir, OpenDir<'a>, "ssh_fxp_opendir"),
             (12, ReadDir, ReadDir<'a>, "ssh_fxp_readdir"),
+            (13, Remove, Remove<'a>, "ssh_fxp_remove"),
+            (14, MkDir, MkDir<'a>, "ssh_fxp_mkdir"),
+            (15, RmDir, RmDir<'a>, "ssh_fxp_rmdir"),
             (16, PathInfo, PathInfo<'a>, "ssh_fxp_realpath"),
             (17, Stat, Stat<'a>, "ssh_fxp_stat"),
+            (18, Rename, Rename<'a>, "ssh_fxp_rename"),
+            (19, ReadLink, ReadLink<'a>, "ssh_fxp_readlink"),
+            (20, Symlink, Symlink<'a>, "ssh_fxp_symlink"),
             // When adding requests, review MAX_REQUEST_LEN in order to adjust its value
         },
 
