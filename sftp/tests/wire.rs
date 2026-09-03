@@ -284,7 +284,7 @@ fn a_short_chunk_ends_the_read() {
     let chunk = client::MAX_READ_LEN as usize;
     s.to_client.push(&data_packet(2, &vec![0xaa; chunk]));
     // Short, so the third chunk's data is beyond a gap
-    s.to_client.push(&data_packet(3, &vec![0xbb; 100]));
+    s.to_client.push(&data_packet(3, &[0xbb; 100]));
     s.to_client.push(&data_packet(4, &vec![0xcc; 500]));
 
     let mut buf = vec![0u8; 2 * chunk + 500];

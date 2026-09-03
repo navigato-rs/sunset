@@ -8,7 +8,10 @@ use sunset_sftp::embedded_io_async;
 use sunset_sftp::{
     error::SftpError,
     protocol::{Attrs, Filename, NameEntry, StatusCode},
-    server::{DirReadDataReply, DirReadReplyFinished, SftpOpResult, SftpSink},
+    server::{
+        DirReadDataReply, DirReadReplyFinished, SftpOpResult, SftpSink, helpers,
+        helpers::LONG_NAME_PREFIX_LEN,
+    },
 };
 
 use sunset::sshwire::SSHEncode;
@@ -38,7 +41,8 @@ pub struct DirEntriesCollection {
 #[derive(Debug)]
 struct Entry {
     filename: String,
-    longname: String,
+    /// Not required to be UTF-8, so kept as bytes
+    longname: Vec<u8>,
     attrs: Attrs,
 }
 
@@ -46,7 +50,7 @@ impl Entry {
     fn name_entry(&self) -> NameEntry<'_> {
         NameEntry {
             filename: Filename::from(self.filename.as_str()),
-            _longname: Filename::from(self.longname.as_str()),
+            _longname: Filename::new(&self.longname),
             attrs: self.attrs,
         }
     }
@@ -74,10 +78,12 @@ impl DirEntriesCollection {
                     .as_ref()
                     .map(|m| get_file_attrs(m.clone()))
                     .unwrap_or_default();
-                let longname = metadata
-                    .as_ref()
-                    .map(|m| long_name(&filename, m))
-                    .unwrap_or_default();
+                // An "ls -l" style line, which clients display
+                let mut lbuf = vec![0u8; LONG_NAME_PREFIX_LEN + filename.len()];
+                let longname =
+                    helpers::write_long_name(&mut lbuf, filename.as_bytes(), &attrs)
+                        .map(|l| l.to_vec())
+                        .unwrap_or_default();
 
                 let e = Entry { filename, longname, attrs };
 
@@ -145,76 +151,6 @@ impl DirEntriesCollection {
         };
         Ok(token)
     }
-}
-
-/// Formats an `ls -l` style line for a `SSH_FXP_NAME` long name.
-///
-/// SFTP version 3 leaves the format undefined and says clients should
-/// not parse it, but OpenSSH's `sftp` displays it verbatim for `ls -l`.
-/// A server that sends an empty long name gives blank lines there.
-fn long_name(filename: &str, metadata: &Metadata) -> String {
-    let mode = metadata.permissions().mode();
-
-    let kind = match mode & 0o170000 {
-        0o040000 => 'd',
-        0o120000 => 'l',
-        0o100000 => '-',
-        0o020000 => 'c',
-        0o060000 => 'b',
-        0o010000 => 'p',
-        0o140000 => 's',
-        _ => '?',
-    };
-
-    let mut perms = String::with_capacity(9);
-    for shift in [6, 3, 0] {
-        let bits = (mode >> shift) & 0o7;
-        perms.push(if bits & 0o4 != 0 { 'r' } else { '-' });
-        perms.push(if bits & 0o2 != 0 { 'w' } else { '-' });
-        perms.push(if bits & 0o1 != 0 { 'x' } else { '-' });
-    }
-
-    format!(
-        "{}{} {:>3} {:<8} {:<8} {:>8} {} {}",
-        kind,
-        perms,
-        metadata.st_nlink(),
-        metadata.st_uid(),
-        metadata.st_gid(),
-        metadata.len(),
-        format_time(metadata.st_mtime()),
-        filename,
-    )
-}
-
-/// Formats a unix timestamp as `ls -l` does, in UTC.
-fn format_time(secs: i64) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
-        "Dec",
-    ];
-
-    let days = secs.div_euclid(86400);
-    let time_of_day = secs.rem_euclid(86400);
-
-    // Days to a civil date, from Howard Hinnant's chrono algorithms
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let _year = yoe + era * 400 + i64::from(month <= 2);
-
-    format!(
-        "{} {:>2} {:02}:{:02}",
-        MONTHS[(month - 1) as usize],
-        day,
-        time_of_day / 3600,
-        (time_of_day % 3600) / 60,
-    )
 }
 
 /// [`std`] helper function to get [`Attrs`] from a [`Metadata`].
