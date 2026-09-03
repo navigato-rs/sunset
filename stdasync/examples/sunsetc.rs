@@ -108,6 +108,11 @@ async fn run(args: Args) -> Result<ExitCode> {
 
         // Connect to a peer
         let mut stream = TcpStream::connect((args.host.as_str(), args.port)).await?;
+        // Interactive sessions send small packets and wait for a reply.
+        // Nagle would hold each one back until the peer's delayed ACK.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Couldn't set TCP_NODELAY: {e}");
+        }
         let (mut rsock, mut wsock) = stream.split();
 
         // SSH connection future

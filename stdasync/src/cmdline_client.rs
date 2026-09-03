@@ -235,6 +235,67 @@ impl CmdlineClient {
     /// Performs authentication, requests a shell or command, performs channel IO.
     /// Will return `Ok` after the session ends normally, or an error.
     pub async fn run<'g, 'a>(&mut self, cli: &'g SSHClient<'a>) -> Result<ExitCode> {
+        self.run_with(cli, |io, extin, pty| Self::chan_run(io, extin, pty)).await
+    }
+
+    /// Runs the session, handing the channel to `f` rather than to the terminal.
+    ///
+    /// Authentication and the shell, command or subsystem request are
+    /// performed as for [`run()`](Self::run). Once the session channel is
+    /// running, `f` is called with it instead of connecting it to
+    /// stdin/stdout. Used for subsystems such as SFTP.
+    ///
+    /// The session ends when `f` returns.
+    /// Anything the server writes to the channel's stderr is copied to
+    /// this process's stderr.
+    pub async fn run_channel<'g, 'a, F, Fut>(
+        &mut self,
+        cli: &'g SSHClient<'a>,
+        f: F,
+    ) -> Result<ExitCode>
+    where
+        F: FnOnce(ChanInOut<'g>) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.run_with(cli, |io, extin, _pty| async move {
+            // The channel's stderr has to be read, otherwise the
+            // session blocks once the server writes to it.
+            let errs = async {
+                if let Some(mut errin) = extin {
+                    let mut eo = crate::stderr_out()
+                        .map_err(|_| Error::msg("opening stderr failed"))?;
+                    loop {
+                        let mut buf = [0u8; 1000];
+                        let l = errin.read(&mut buf).await?;
+                        if l == 0 {
+                            break;
+                        }
+                        eo.write_all(&buf[..l])
+                            .await
+                            .map_err(|_| Error::ChannelEOF)?;
+                    }
+                }
+                Ok::<_, Error>(())
+            };
+
+            match embassy_futures::select::select(f(io), errs).await {
+                Either::First(r) => r,
+                Either::Second(r) => r,
+            }
+        })
+        .await
+    }
+
+    /// The session logic shared by `run()` and `run_channel()`.
+    async fn run_with<'g, 'a, F, Fut>(
+        &mut self,
+        cli: &'g SSHClient<'a>,
+        chan_handler: F,
+    ) -> Result<ExitCode>
+    where
+        F: FnOnce(ChanInOut<'g>, Option<ChanIn<'g>>, Option<RawPtyGuard>) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         let mut io = None;
         let mut extin = None;
 
@@ -336,7 +397,7 @@ impl CmdlineClient {
 
         let chanio = async {
             let (io, extin, pty) = launch_chan.receive().await;
-            Self::chan_run(io, extin, pty).await
+            chan_handler(io, extin, pty).await
         };
 
         match embassy_futures::select::select(prog_loop, chanio).await {

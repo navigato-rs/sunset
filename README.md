@@ -24,6 +24,7 @@ A SSH client and server implementation. This is a fork of
   server async library in normal Rust (not `no_std`). This uses Tokio or async-std.
 
   The [examples](stdasync/examples) include a Linux commandline SSH client `sunsetc`. It works as a day-to-day SSH client.
+  `sftpc` is a commandline SFTP client using `sunset-sftp`.
 
 - [`sunset-sftp`](sftp/) implements an SFTP server and client. An example of the
   application side is in [demo/sftp/std](demo/sftp/std). `sunset-sftp` is currently
@@ -51,7 +52,7 @@ Working:
 
 Desirable:
 
-- SFTP request pipelining, and a commandline SFTP client
+- SFTP request pipelining
 - sntrup761
 - Inbound / remote TCP forwarding (`forwarded-tcpip`)
 - A std server example
