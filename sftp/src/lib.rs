@@ -48,8 +48,9 @@
 //!
 //! File contents and directory listings are streamed, so transfers
 //! aren't limited by the client's buffer size. Reads and writes larger
-//! than one packet are split and pipelined, so a transfer isn't limited
-//! to one chunk per round trip.
+//! than one packet are split into several requests, and reads are
+//! pipelined so that a download isn't limited to one chunk per round
+//! trip. Writes wait for each reply, see [`SftpClient::write`](client::SftpClient::write).
 //!
 //! # Roadmap
 //!
@@ -88,7 +89,7 @@
 //! ## Client
 //!
 //! - [x] A commandline SFTP client, `sftpc` in `sunset-stdasync`
-//! - [x] Pipelining transfers, to avoid a round trip per block
+//! - [x] Pipelining reads, to avoid a round trip per block downloaded
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

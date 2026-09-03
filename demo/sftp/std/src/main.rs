@@ -151,33 +151,31 @@ impl DemoServer for StdDemo {
             Ok(())
         };
 
-        #[allow(unreachable_code)]
+        // One SFTP session per connection: returning ends the
+        // connection, which is what lets the client's ssh exit.
         let sftp_loop = async {
             // A larger response buffer than the default, see SFTP_RESP_BUF.
             let mut sftp_handler =
                 SftpServerHandler::<{ MAX_REQUEST_LEN }, SFTP_RESP_BUF>::new();
-            loop {
-                let ch = chan_pipe.receive().await;
 
-                info!("SFTP loop has received a channel handle {:?}", ch.num());
+            let ch = chan_pipe.receive().await;
+            info!("SFTP loop has received a channel handle {:?}", ch.num());
 
-                let (chan_in, chan_out) = serv.stdio(ch).await?.split();
-                let mut file_server =
-                    DemoSftpServer::new("./demo/sftp/std/testing/out/".to_string());
+            let (chan_in, chan_out) = serv.stdio(ch).await?.split();
+            let mut file_server =
+                DemoSftpServer::new("./demo/sftp/std/testing/out/".to_string());
 
-                match sftp_handler.run(&mut file_server, chan_in, chan_out).await {
-                    // The client closing the channel ends the session,
-                    // and another may follow on this connection.
-                    Ok(()) | Err(SftpError::Disconnected) => {
-                        info!("sftp session finished")
-                    }
-                    Err(e) => {
-                        error!("sftp session failed: {:?}", e);
-                        return Err(e.into());
-                    }
+            match sftp_handler.run(&mut file_server, chan_in, chan_out).await {
+                // The client closing the channel is a normal end
+                Ok(()) | Err(SftpError::Disconnected) => {
+                    info!("sftp session finished");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("sftp session failed: {:?}", e);
+                    Err(e.into())
                 }
             }
-            Ok::<_, Error>(())
         };
 
         let selected = select(ssh_loop, sftp_loop).await;
