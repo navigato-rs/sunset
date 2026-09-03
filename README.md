@@ -49,6 +49,7 @@ Working:
 - Client `direct-tcpip` (local TCP forward, the channel behind `ssh -L` / `ssh -J`)
 - Agent-held `sk-ssh-ed25519@openssh.com` keys (signing stays in the agent)
 - Up to 16 concurrent channels
+- Client-initiated channel EOF, so remote commands reading stdin can finish
 
 Desirable:
 

@@ -1,5 +1,21 @@
 # Sunset Changelog
 
+## Unreleased
+
+### Added
+
+- `Runner::send_channel_eof()`, and `send_eof()` on the async channel
+  types. Previously `SSH_MSG_CHANNEL_EOF` was only ever sent in reply to
+  the peer's, so an application could not tell a remote command that its
+  standard input had ended. Commands that read to end of input, such as
+  `tar xf -` or `cat > file`, could never finish.
+
+### Fixed
+
+- `sunsetc` sends channel EOF when its own input ends, rather than
+  ending the session. Output produced after the input ended, which was
+  previously lost, now arrives.
+
 ## 0.6.0 - 2026-08-02
 
 ### Changed

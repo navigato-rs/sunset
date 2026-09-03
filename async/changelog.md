@@ -1,5 +1,12 @@
 # `sunset-async` Changelog
 
+## Unreleased
+
+### Added
+
+- `send_eof()` on `ChanInOut` and `ChanOut`, telling the peer no more
+  data will be sent while the channel stays open for reading.
+
 ## 0.6.0 - 2026-08-02
 
 ### Added

@@ -212,6 +212,15 @@ impl Channels {
         Ok(())
     }
 
+    /// Sends `SSH_MSG_CHANNEL_EOF`, see [`Runner::send_channel_eof`].
+    pub(crate) fn send_eof(&mut self, num: ChanNum, s: &mut TrafSend) -> Result<()> {
+        self.get_mut(num)?.send_eof(s)
+    }
+
+    pub(crate) fn have_sent_eof(&self, num: ChanNum) -> bool {
+        self.get(num).is_ok_and(|c| c.have_sent_eof())
+    }
+
     pub(crate) fn have_recv_eof(&self, num: ChanNum) -> bool {
         self.get(num).is_ok_and(|c| c.have_recv_eof())
     }
@@ -994,10 +1003,8 @@ impl Channel {
 
     fn handle_eof(&mut self, s: &mut TrafSend, is_client: bool) -> Result<()> {
         //TODO: check existing state?
-        if !self.sent_eof {
-            s.send(packets::ChannelEof { num: self.send_num()? })?;
-            self.sent_eof = true;
-        }
+        // Reply with our own EOF, we won't be sending more either.
+        self.send_eof(s)?;
 
         // Wake readers on EOF
         self.wake_read(ChanData::Normal, is_client);
@@ -1008,6 +1015,21 @@ impl Channel {
         self.state = ChanState::RecvEof;
         // todo!();
         Ok(())
+    }
+
+    /// Tells the peer no more data will be sent on this channel.
+    ///
+    /// Repeated calls are ignored, `SSH_MSG_CHANNEL_EOF` is only sent once.
+    fn send_eof(&mut self, s: &mut TrafSend) -> Result<()> {
+        if !self.sent_eof {
+            s.send(packets::ChannelEof { num: self.send_num()? })?;
+            self.sent_eof = true;
+        }
+        Ok(())
+    }
+
+    fn have_sent_eof(&self) -> bool {
+        self.sent_eof
     }
 
     fn handle_close(&mut self, s: &mut TrafSend, is_client: bool) -> Result<()> {

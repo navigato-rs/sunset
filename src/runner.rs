@@ -518,6 +518,11 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
             return error::ChannelEOF.fail();
         }
 
+        if self.is_channel_send_eof(chan) {
+            // We told the peer we were finished sending
+            return error::ChannelEOF.fail();
+        }
+
         if buf.is_empty() {
             return Ok(0);
         }
@@ -609,6 +614,29 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
     /// Returns `None` if no data ready.
     pub fn read_channel_ready(&self) -> Option<(ChanNum, ChanData, usize)> {
         self.traf_in.read_channel_ready()
+    }
+
+    /// Tells the peer that no more data will be sent on this channel.
+    ///
+    /// The channel stays open for reading, so a remote command sees its
+    /// standard input end while still being able to reply. That is what
+    /// `sh -c "cat > file"` or `tar xf -` need in order to finish.
+    ///
+    /// Later writes to the channel fail with `Error::ChannelEOF`.
+    /// Repeated calls are ignored.
+    pub fn send_channel_eof(&mut self, chan: &ChanHandle) -> Result<()> {
+        if self.traf_out.closed() {
+            return error::ChannelEOF.fail();
+        }
+        let mut s = self.traf_out.sender(&mut self.keys);
+        self.conn.channels.send_eof(chan.0, &mut s)?;
+        self.wake();
+        Ok(())
+    }
+
+    /// Whether [`send_channel_eof()`](Self::send_channel_eof) has been called.
+    pub fn is_channel_send_eof(&self, chan: &ChanHandle) -> bool {
+        self.conn.channels.have_sent_eof(chan.0)
     }
 
     pub fn is_channel_eof(&self, chan: &ChanHandle) -> bool {
