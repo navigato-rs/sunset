@@ -24,10 +24,21 @@ struct SftpDir;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::{fs::File, os::unix::fs::FileExt, path::Path};
+use std::time::{Duration, SystemTime};
+use std::{
+    fs::File,
+    os::unix::fs::FileExt,
+    path::{Path, PathBuf},
+};
 
 /// Used during read operations
 const ARBITRARY_READ_BUFFER_LENGTH: usize = 1024;
+
+/// Response buffer for the `SftpServerHandler` this server is used with.
+///
+/// Larger than the default, so that a directory entry with a long file
+/// name and its `ls -l` style long name fits in one response.
+pub const SFTP_RESP_BUF: usize = 2048;
 
 #[derive(Debug)]
 pub(crate) struct PrivateFileHandle {
@@ -115,6 +126,42 @@ impl DemoSftpServer {
             files: ArrayMap::new(),
             dirs: ArrayMap::new(),
         }
+    }
+}
+
+impl DemoSftpServer {
+    /// Checks a client provided path stays within the served directory.
+    ///
+    /// Untrusted input: user upload, API param, config value, AI agent
+    /// output, archive entry...
+    fn validate(&self, path: &str) -> SftpOpResult<StrictPath<SftpDir>> {
+        self.base_path.strict_join(path).map_err(|e| {
+            error!(
+                "Could not validate {:?} within the boundary {:?}: {:?}",
+                path, self.base_path, e
+            );
+            StatusCode::SSH_FX_PERMISSION_DENIED
+        })
+    }
+
+    /// Validates a path without resolving a symlink at the end of it.
+    ///
+    /// `strict_join()` resolves symlinks, which is the wrong thing for
+    /// operations that act on the link rather than its target. The
+    /// parent directory is validated instead, and the last component is
+    /// required to be a plain name so that it can't escape.
+    fn validate_nofollow(&self, path: &str) -> SftpOpResult<PathBuf> {
+        let path = path.trim_end_matches('/');
+        let (parent, name) = match path.rsplit_once('/') {
+            Some((p, n)) => (p, n),
+            None => ("", path),
+        };
+        if name.is_empty() || name == "." || name == ".." {
+            debug!("Not a plain file name: {:?}", path);
+            return Err(StatusCode::SSH_FX_FAILURE);
+        }
+        let parent = self.validate(if parent.is_empty() { "." } else { parent })?;
+        Ok(Path::new(parent.interop_path()).join(name))
     }
 }
 
@@ -428,7 +475,8 @@ impl SftpServer for DemoSftpServer {
                 StatusCode::SSH_FX_PERMISSION_DENIED
             })?;
 
-            let name_entry_collection = DirEntriesCollection::new(dir_iterator)?;
+            let name_entry_collection =
+                DirEntriesCollection::new(dir_iterator, SFTP_RESP_BUF)?;
 
             let encoded_length = name_entry_collection.encoded_length();
             let items_count = name_entry_collection.count();
@@ -456,24 +504,170 @@ impl SftpServer for DemoSftpServer {
         file_path: &str,
     ) -> SftpOpResult<Attrs> {
         log::debug!("SftpServer ListStats: file_path = {:?}", file_path);
-        let file_path = Path::new(file_path);
-
         let metadata = if follow_links {
-            file_path.metadata() // follows symlinks
+            self.validate(file_path)?.metadata()
         } else {
-            file_path.symlink_metadata() // doesn't follow symlinks
+            // The link itself, not what it points at
+            fs::symlink_metadata(self.validate_nofollow(file_path)?)
         }
-        .map_err(|err| {
-            error!("Problem listing stats: {:?}", err);
-            StatusCode::SSH_FX_FAILURE
-        })?;
+        .map_err(map_io_error)?;
 
-        if file_path.is_file() {
-            return Ok(get_file_attrs(metadata));
-        } else if file_path.is_symlink() {
-            return Ok(get_file_attrs(metadata));
-        } else {
-            return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
-        }
+        Ok(get_file_attrs(metadata))
     }
+
+    async fn fattrs(&mut self, fh: FileHandle) -> SftpOpResult<Attrs> {
+        let Some(private_file_handle) = self.files.get(fh.0 as usize) else {
+            return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
+        };
+        let metadata = private_file_handle.file.metadata().map_err(map_io_error)?;
+        Ok(get_file_attrs(metadata))
+    }
+
+    async fn set_attrs(
+        &mut self,
+        file_path: &str,
+        attrs: &Attrs,
+    ) -> SftpOpResult<()> {
+        debug!("SetStat {:?}: {:?}", file_path, attrs);
+        let validated = self.validate(file_path)?;
+
+        if let Some(mode) = attrs.permissions {
+            validated
+                .set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(map_io_error)?;
+        }
+
+        if attrs.size.is_some() || attrs.atime.is_some() || attrs.mtime.is_some() {
+            let file =
+                validated.open_with().write(true).open().map_err(map_io_error)?;
+            apply_size_and_times(&file, attrs)?;
+        }
+        Ok(())
+    }
+
+    async fn set_fattrs(
+        &mut self,
+        fh: FileHandle,
+        attrs: &Attrs,
+    ) -> SftpOpResult<()> {
+        debug!("FSetStat {:?}: {:?}", fh, attrs);
+        let Some(private_file_handle) = self.files.get(fh.0 as usize) else {
+            return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
+        };
+
+        if let Some(mode) = attrs.permissions {
+            private_file_handle
+                .file
+                .set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(map_io_error)?;
+            private_file_handle.permissions = Some(mode & 0o777);
+        }
+        apply_size_and_times(&private_file_handle.file, attrs)
+    }
+
+    async fn remove(&mut self, file_path: &str) -> SftpOpResult<()> {
+        debug!("Remove {:?}", file_path);
+        let validated = self.validate(file_path)?;
+        if validated.is_dir() {
+            // SSH_FXP_REMOVE is for files, SSH_FXP_RMDIR removes
+            // directories.
+            return Err(StatusCode::SSH_FX_FAILURE);
+        }
+        validated.remove_file().map_err(map_io_error)
+    }
+
+    async fn mkdir(&mut self, dir_path: &str, attrs: &Attrs) -> SftpOpResult<()> {
+        debug!("MkDir {:?}: {:?}", dir_path, attrs);
+        let validated = self.validate(dir_path)?;
+        validated.create_dir().map_err(map_io_error)?;
+        if let Some(mode) = attrs.permissions {
+            validated
+                .set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(map_io_error)?;
+        }
+        Ok(())
+    }
+
+    async fn rmdir(&mut self, dir_path: &str) -> SftpOpResult<()> {
+        debug!("RmDir {:?}", dir_path);
+        let validated = self.validate(dir_path)?;
+        if !validated.is_dir() {
+            return Err(StatusCode::SSH_FX_FAILURE);
+        }
+        validated.remove_dir().map_err(map_io_error)
+    }
+
+    async fn rename(&mut self, old_path: &str, new_path: &str) -> SftpOpResult<()> {
+        debug!("Rename {:?} to {:?}", old_path, new_path);
+        let old = self.validate(old_path)?;
+        let new = self.validate(new_path)?;
+
+        // Version 3 rename must not replace the destination. This check
+        // isn't atomic, a real server would use renameat2() or link().
+        if new.exists() {
+            return Err(StatusCode::SSH_FX_FAILURE);
+        }
+        old.strict_rename(new.interop_path()).map_err(map_io_error)
+    }
+
+    async fn readlink(&mut self, file_path: &str) -> SftpOpResult<NameEntry<'_>> {
+        debug!("ReadLink {:?}", file_path);
+        let link = self.validate_nofollow(file_path)?;
+        let target = fs::read_link(&link).map_err(map_io_error)?;
+
+        // Don't hand out paths from outside the served directory
+        let target = target.to_str().ok_or(StatusCode::SSH_FX_FAILURE)?;
+        self.last_real_path =
+            self.validate(target)?.strictpath_display().to_string();
+
+        Ok(NameEntry {
+            filename: Filename::from(self.last_real_path.as_str()),
+            _longname: Filename::from(""),
+            attrs: Attrs::default(),
+        })
+    }
+
+    async fn symlink(
+        &mut self,
+        target_path: &str,
+        link_path: &str,
+    ) -> SftpOpResult<()> {
+        debug!("Symlink {:?} to {:?}", link_path, target_path);
+        let target = self.validate(target_path)?;
+        // The link doesn't exist yet, and must not be resolved if it
+        // does, so only its parent is validated.
+        let link = self.validate_nofollow(link_path)?;
+        target.strict_symlink(&link).map_err(map_io_error)
+    }
+}
+
+/// Maps a filesystem error to the closest SFTP status.
+fn map_io_error(err: std::io::Error) -> StatusCode {
+    use std::io::ErrorKind;
+    error!("Filesystem error: {:?}", err);
+    match err.kind() {
+        ErrorKind::NotFound => StatusCode::SSH_FX_NO_SUCH_FILE,
+        ErrorKind::PermissionDenied => StatusCode::SSH_FX_PERMISSION_DENIED,
+        _ => StatusCode::SSH_FX_FAILURE,
+    }
+}
+
+/// Applies the size and timestamp parts of a `SSH_FXP_SETSTAT`.
+fn apply_size_and_times(file: &File, attrs: &Attrs) -> SftpOpResult<()> {
+    if let Some(size) = attrs.size {
+        file.set_len(size).map_err(map_io_error)?;
+    }
+
+    if attrs.atime.is_some() || attrs.mtime.is_some() {
+        let to_time = |t: Option<u32>| {
+            t.map(|t| SystemTime::UNIX_EPOCH + Duration::from_secs(t as u64))
+        };
+        // SFTP sets both together, but be tolerant of only one.
+        let now = SystemTime::now();
+        let times = fs::FileTimes::new()
+            .set_accessed(to_time(attrs.atime).unwrap_or(now))
+            .set_modified(to_time(attrs.mtime).unwrap_or(now));
+        file.set_times(times).map_err(map_io_error)?;
+    }
+    Ok(())
 }

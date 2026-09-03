@@ -3,10 +3,11 @@ use log::LevelFilter;
 use sunset::*;
 use sunset_async::{ProgressHolder, SSHServer, SunsetMutex, SunsetRawMutex};
 use sunset_sftp::SftpServerHandler;
+use sunset_sftp::server::MAX_REQUEST_LEN;
 
 use sunset_demo_common::{self, DemoCommon, DemoServer, SSHConfig};
 
-use crate::demosftpserver::DemoSftpServer;
+use crate::demosftpserver::{DemoSftpServer, SFTP_RESP_BUF};
 
 use embassy_executor::Spawner;
 use embassy_net::{Stack, StackResources, StaticConfigV4};
@@ -151,7 +152,9 @@ impl DemoServer for StdDemo {
 
         #[allow(unreachable_code)]
         let sftp_loop = async {
-            let mut sftp_handler = SftpServerHandler::default();
+            // A larger response buffer than the default, see SFTP_RESP_BUF.
+            let mut sftp_handler =
+                SftpServerHandler::<{ MAX_REQUEST_LEN }, SFTP_RESP_BUF>::new();
             loop {
                 let ch = chan_pipe.receive().await;
 
