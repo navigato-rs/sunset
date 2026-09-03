@@ -56,15 +56,20 @@ pub const MAX_PATH_LEN: usize = 4096; // Linux glibc PATH_MAX is typically 4096 
 /// Read/write packet payloads are not included in this size, they
 /// are handled independently.
 ///
-/// The longest requests are `SSH_FXP_RENAME` and `SSH_FXP_SYMLINK`,
-/// which carry two paths.
+/// The longest requests carry two paths: `SSH_FXP_RENAME`,
+/// `SSH_FXP_SYMLINK`, and the extended requests that take an extension
+/// name as well.
 pub const MAX_REQUEST_LEN: usize = SFTP_MINIMUM_PACKET_LEN // length, type, req id
+                                + 4 + MAX_EXT_NAME_LEN // extension name
                                 + 2 * (4 + MAX_PATH_LEN); // Two path strings
+
+/// Longest extension name that is handled.
+///
+/// The longest in use is `posix-rename@openssh.com`.
+pub const MAX_EXT_NAME_LEN: usize = 32;
 
 /// `SSH_FXP_EXTENDED` packet type.
 ///
-/// Extended requests have a vendor specific payload so they aren't part
-/// of the [`SftpPacket`] enum, they are encoded directly.
 /// See [Vendor-Specific-Extensions](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-8).
 pub const SSH_FXP_EXTENDED: u8 = 200;
 
@@ -362,6 +367,117 @@ pub struct Symlink<'a> {
     pub target_path: TextString<'a>,
     /// The path of the symlink to create
     pub link_path: TextString<'a>,
+}
+
+/// Used for `ssh_fxp_extended` [requests](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-8).
+///
+/// The payload after the name is defined by whoever defined the
+/// extension, so it is left undecoded.
+#[derive(Debug)]
+pub struct ExtendedRequest<'a> {
+    /// The extension being invoked, such as `fsync@openssh.com`
+    pub name: TextString<'a>,
+    /// The rest of the packet
+    pub data: &'a [u8],
+}
+
+impl<'de> SSHDecode<'de> for ExtendedRequest<'de> {
+    fn dec<S>(s: &mut S) -> WireResult<Self>
+    where
+        S: SSHSource<'de>,
+    {
+        let name = TextString::dec(s)?;
+        // The extension defines the rest, so take all of it.
+        let len = s.remaining();
+        let data = s.take(len)?;
+        Ok(ExtendedRequest { name, data })
+    }
+}
+
+impl SSHEncode for ExtendedRequest<'_> {
+    fn enc(&self, s: &mut dyn SSHSink) -> WireResult<()> {
+        self.name.enc(s)?;
+        s.push(self.data)
+    }
+}
+
+/// Protocol extensions, as announced in `SSH_FXP_VERSION`.
+///
+/// A client reads these with
+/// [`SftpClient::extensions()`](crate::client::SftpClient::extensions).
+/// A server announces them by implementing
+/// [`SftpServer::extensions()`](crate::server::SftpServer::extensions).
+///
+/// Only `posix_rename`, `hardlink` and `fsync` are implemented by
+/// Sunset; the others are recognised so that a client can tell whether
+/// a peer offers them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Extensions {
+    /// `posix-rename@openssh.com`, a rename that replaces the destination
+    pub posix_rename: bool,
+    /// `hardlink@openssh.com`
+    pub hardlink: bool,
+    /// `fsync@openssh.com`
+    pub fsync: bool,
+    /// `statvfs@openssh.com`, not implemented by Sunset
+    pub statvfs: bool,
+    /// `limits@openssh.com`, not implemented by Sunset
+    pub limits: bool,
+}
+
+/// Extension names, and the data each is announced with.
+///
+/// OpenSSH announces a version number as the data.
+const EXT_NAMES: [&str; 5] = [
+    "posix-rename@openssh.com",
+    "hardlink@openssh.com",
+    "fsync@openssh.com",
+    "statvfs@openssh.com",
+    "limits@openssh.com",
+];
+
+impl Extensions {
+    fn enabled(&self) -> [bool; 5] {
+        [self.posix_rename, self.hardlink, self.fsync, self.statvfs, self.limits]
+    }
+
+    /// Records an extension announced by a peer.
+    pub(crate) fn set_by_name(&mut self, name: &[u8]) {
+        let flags = [
+            &mut self.posix_rename,
+            &mut self.hardlink,
+            &mut self.fsync,
+            &mut self.statvfs,
+            &mut self.limits,
+        ];
+        for (f, n) in flags.into_iter().zip(EXT_NAMES) {
+            if name == n.as_bytes() {
+                *f = true;
+                return;
+            }
+        }
+        trace!("Ignoring unknown SFTP extension");
+    }
+
+    /// Encoded length of the announcement pairs.
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.enabled()
+            .iter()
+            .zip(EXT_NAMES)
+            .filter(|(on, _)| **on)
+            // name string, then "1" as the data
+            .map(|(_, n)| 4 + n.len() + 4 + 1)
+            .sum()
+    }
+
+    /// Encodes the announcement pairs, as they follow a `SSH_FXP_VERSION`.
+    pub(crate) fn enc_pairs(&self, s: &mut dyn SSHSink) -> WireResult<()> {
+        for (_, n) in self.enabled().iter().zip(EXT_NAMES).filter(|(on, _)| **on) {
+            TextString(n.as_bytes()).enc(s)?;
+            TextString(b"1").enc(s)?;
+        }
+        Ok(())
+    }
 }
 
 // ============================= Responses =============================
@@ -821,8 +937,8 @@ macro_rules! sftpmessages {
             }
 
             pub(crate) fn is_request(&self) -> bool {
-                // TODO SSH_FXP_EXTENDED
-                (3..=20).contains(&(u8::from(*self)))
+                let n = u8::from(*self);
+                (3..=20).contains(&n) || n == SSH_FXP_EXTENDED
             }
 
             fn is_response(&self) -> bool {
@@ -1042,6 +1158,7 @@ sftpmessages! [
             (18, Rename, Rename<'a>, "ssh_fxp_rename"),
             (19, ReadLink, ReadLink<'a>, "ssh_fxp_readlink"),
             (20, Symlink, Symlink<'a>, "ssh_fxp_symlink"),
+            (200, Extended, ExtendedRequest<'a>, "ssh_fxp_extended"),
             // When adding requests, review MAX_REQUEST_LEN in order to adjust its value
         },
 

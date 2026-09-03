@@ -5,7 +5,7 @@ use sunset_sftp::embedded_io_async;
 use sunset_sftp::server::DirReadReplyFinished;
 use sunset_sftp::{
     error::SftpResult,
-    protocol::{Attrs, Filename, NameEntry, PFlags, StatusCode},
+    protocol::{Attrs, Extensions, Filename, NameEntry, PFlags, StatusCode},
     server::{
         DirHandle, DirReadHeaderReply, FileHandle, ReadHeaderReply,
         ReadReplyFinished, ReadStatus, SftpOpResult, SftpServer,
@@ -625,6 +625,47 @@ impl SftpServer for DemoSftpServer {
             _longname: Filename::from(""),
             attrs: Attrs::default(),
         })
+    }
+
+    fn extensions(&self) -> Extensions {
+        // The three that SftpServerHandler dispatches
+        Extensions {
+            posix_rename: true,
+            hardlink: true,
+            fsync: true,
+            ..Default::default()
+        }
+    }
+
+    async fn posix_rename(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> SftpOpResult<()> {
+        debug!("PosixRename {:?} to {:?}", old_path, new_path);
+        // Unlike rename(), this replaces an existing destination
+        let old = self.validate(old_path)?;
+        let new = self.validate_nofollow(new_path)?;
+        old.strict_rename(&new).map_err(map_io_error)
+    }
+
+    async fn hardlink(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> SftpOpResult<()> {
+        debug!("Hardlink {:?} to {:?}", old_path, new_path);
+        let old = self.validate(old_path)?;
+        // The new name doesn't exist yet, so it can't be resolved
+        let new = self.validate_nofollow(new_path)?;
+        old.strict_hard_link(&new).map_err(map_io_error)
+    }
+
+    async fn fsync(&mut self, fh: FileHandle) -> SftpOpResult<()> {
+        let Some(private_file_handle) = self.files.get(fh.0 as usize) else {
+            return Err(StatusCode::SSH_FX_NO_SUCH_FILE);
+        };
+        private_file_handle.file.sync_all().map_err(map_io_error)
     }
 
     async fn symlink(

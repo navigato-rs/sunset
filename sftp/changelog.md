@@ -20,13 +20,21 @@
 - `SftpError` has new `BadResponse`, `NoRoom`, `BadHandle` and
   `Interrupted` variants, used by the client.
 
+- The `posix-rename@openssh.com`, `hardlink@openssh.com` and
+  `fsync@openssh.com` extensions on both sides. A server announces what
+  it implements with `SftpServer::extensions()`, and the handler
+  dispatches those three; any other `SSH_FXP_EXTENDED` is answered with
+  `SSH_FX_OP_UNSUPPORTED`. A client reads what a peer announced with
+  `SftpClient::extensions()`.
+
 ### Changed
 
 - `MAX_REQUEST_LEN` now includes the packet length field and header, and
-  allows for the two paths of a rename or symlink. It grows from 296 to
-  529 bytes with the default `MAX_PATH_LEN`, which increases the default
-  `SftpServerHandler` buffers by the same amount. Previously it was
-  slightly too small to receive a maximum length `SSH_FXP_OPEN`.
+  allows for the two paths of a rename, symlink or extended request. It
+  grows from 296 to 565 bytes with the default `MAX_PATH_LEN`, which
+  increases the default `SftpServerHandler` buffers by the same amount.
+  Previously it was slightly too small to receive a maximum length
+  `SSH_FXP_OPEN`.
 
 - The server now returns the `StatusCode` that a `SftpServer` produced
   for failed `open`, `opendir` and `close` requests, rather than

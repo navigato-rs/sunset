@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 
 use sunset_sftp::embedded_io_async::Write;
 use sunset_sftp::error::{SftpError, SftpResult};
-use sunset_sftp::protocol::{Attrs, Filename, NameEntry, PFlags, StatusCode};
+use sunset_sftp::protocol::{
+    Attrs, Extensions, Filename, NameEntry, PFlags, StatusCode,
+};
 use sunset_sftp::server::{
     DirHandle, DirReadHeaderReply, DirReadReplyFinished, FileHandle,
     ReadHeaderReply, ReadReplyFinished, SftpOpResult, SftpServer, helpers,
@@ -89,10 +91,26 @@ pub struct MemFs {
     next_handle: u32,
     /// Storage for the borrowed name in realpath/readlink replies
     scratch: String,
+    /// What to announce in SSH_FXP_VERSION
+    extensions: Extensions,
 }
 
 impl MemFs {
     pub fn new() -> Self {
+        Self::with_extensions(Extensions {
+            posix_rename: true,
+            hardlink: true,
+            fsync: true,
+            ..Default::default()
+        })
+    }
+
+    /// A server announcing no extensions at all.
+    pub fn without_extensions() -> Self {
+        Self::with_extensions(Extensions::default())
+    }
+
+    pub fn with_extensions(extensions: Extensions) -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert("/".to_string(), Node::Dir { perms: DIR_PERMS });
         Self {
@@ -101,6 +119,7 @@ impl MemFs {
             open_dirs: BTreeMap::new(),
             next_handle: 1,
             scratch: String::new(),
+            extensions,
         }
     }
 
@@ -436,6 +455,48 @@ impl SftpServer for MemFs {
             Some(_) => Err(StatusCode::SSH_FX_FAILURE),
             None => Err(StatusCode::SSH_FX_NO_SUCH_FILE),
         }
+    }
+
+    fn extensions(&self) -> Extensions {
+        self.extensions
+    }
+
+    async fn posix_rename(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> SftpOpResult<()> {
+        // Unlike rename(), this replaces the destination
+        let old = norm(old_path);
+        let new = norm(new_path);
+        let node = self.nodes.remove(&old).ok_or(StatusCode::SSH_FX_NO_SUCH_FILE)?;
+        self.nodes.insert(new, node);
+        Ok(())
+    }
+
+    async fn hardlink(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> SftpOpResult<()> {
+        let old = norm(old_path);
+        let new = norm(new_path);
+        if self.nodes.contains_key(&new) {
+            return Err(StatusCode::SSH_FX_FAILURE);
+        }
+        // A copy rather than a shared inode, which is enough here
+        let node =
+            self.nodes.get(&old).cloned().ok_or(StatusCode::SSH_FX_NO_SUCH_FILE)?;
+        self.nodes.insert(new, node);
+        Ok(())
+    }
+
+    async fn fsync(&mut self, handle: FileHandle) -> SftpOpResult<()> {
+        // Nothing to flush, but the handle must be one of ours
+        self.open_files
+            .contains_key(&handle.0)
+            .then_some(())
+            .ok_or(StatusCode::SSH_FX_FAILURE)
     }
 
     async fn rename(&mut self, old_path: &str, new_path: &str) -> SftpOpResult<()> {

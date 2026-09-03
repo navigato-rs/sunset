@@ -5,6 +5,6 @@ mod sftpclient;
 
 pub use dir::{DirEntry, DirIter};
 pub use sftpclient::{
-    DEFAULT_CLIENT_BUF, Extensions, MAX_READ_LEN, MAX_WRITE_LEN, PIPELINE_DEPTH,
-    RemoteHandle, SftpClient, pflags,
+    DEFAULT_CLIENT_BUF, MAX_READ_LEN, MAX_WRITE_LEN, PIPELINE_DEPTH, RemoteHandle,
+    SftpClient, pflags,
 };

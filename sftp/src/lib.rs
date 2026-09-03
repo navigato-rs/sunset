@@ -80,10 +80,10 @@
 //! - [x] [Reading](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.8) files attributes
 //! - [x] [Setting](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.9) files attributes
 //! - [x] [Dealing with Symbolic links](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.10)
-//! - [ ] [Vendor Specific](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-8)
-//!   request and responses. The client sends the `posix-rename`,
-//!   `hardlink` and `fsync` OpenSSH extensions, the server answers
-//!   `SSH_FXP_EXTENDED` with `SSH_FX_OP_UNSUPPORTED`.
+//! - [x] [Vendor Specific](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-8)
+//!   requests. The `posix-rename`, `hardlink` and `fsync` OpenSSH
+//!   extensions are implemented on both sides; any other
+//!   `SSH_FXP_EXTENDED` is answered with `SSH_FX_OP_UNSUPPORTED`.
 //!
 //! ## Client
 //!
@@ -123,6 +123,7 @@ pub mod server {
     };
     pub use crate::sftpserver::{ReadDataReply, ReadHeaderReply, ReadReplyFinished};
 
+    pub use crate::proto::Extensions;
     pub use crate::sftpserver::ReadStatus;
     pub use crate::sftpserver::SftpOpResult;
     pub use crate::sftpserver::{DirHandle, FileHandle, SftpServer};
@@ -142,8 +143,9 @@ pub mod server {
 /// [`SftpClient`](client::SftpClient) drives a SFTP session over a SSH
 /// channel that has had the `sftp` subsystem started on it.
 pub mod client {
+    pub use crate::proto::Extensions;
     pub use crate::sftpclient::{
-        DEFAULT_CLIENT_BUF, Extensions, MAX_READ_LEN, MAX_WRITE_LEN, PIPELINE_DEPTH,
+        DEFAULT_CLIENT_BUF, MAX_READ_LEN, MAX_WRITE_LEN, PIPELINE_DEPTH,
         RemoteHandle, SftpClient, pflags,
     };
     pub use crate::sftpclient::{DirEntry, DirIter};
@@ -152,6 +154,8 @@ pub mod client {
 /// SFTP Protocol types and structures
 pub mod protocol {
     pub use crate::proto::Attrs;
+    pub use crate::proto::ExtendedRequest;
+    pub use crate::proto::Extensions;
     pub use crate::proto::Filename;
     pub use crate::proto::Name;
     pub use crate::proto::NameEntry;
