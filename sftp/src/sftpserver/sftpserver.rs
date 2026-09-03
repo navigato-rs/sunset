@@ -313,4 +313,159 @@ pub trait SftpServer {
             Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
         }
     }
+
+    /// Provides the attributes of an already open file
+    ///
+    /// `SSH_FXP_FSTAT` for a directory handle is answered with
+    /// `SSH_FX_OP_UNSUPPORTED` without reaching this method.
+    fn fattrs(
+        &mut self,
+        handle: FileHandle,
+    ) -> impl core::future::Future<Output = SftpOpResult<Attrs>> {
+        async move {
+            log::error!(
+                "SftpServer FStat operation not defined: handle = {:?}",
+                handle
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Sets the attributes of the given file path
+    ///
+    /// Only the attributes present in `attrs` should be modified.
+    fn set_attrs(
+        &mut self,
+        file_path: &str,
+        attrs: &Attrs,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer SetStat operation not defined: file_path = {:?}, \
+                attrs = {:?}",
+                file_path,
+                attrs
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Sets the attributes of an already open file
+    ///
+    /// Only the attributes present in `attrs` should be modified.
+    /// `SSH_FXP_FSETSTAT` for a directory handle is answered with
+    /// `SSH_FX_OP_UNSUPPORTED` without reaching this method.
+    fn set_fattrs(
+        &mut self,
+        handle: FileHandle,
+        attrs: &Attrs,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer FSetStat operation not defined: handle = {:?}, \
+                attrs = {:?}",
+                handle,
+                attrs
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Removes a file. This must not remove directories.
+    fn remove(
+        &mut self,
+        file_path: &str,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer Remove operation not defined: file_path = {:?}",
+                file_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Creates a directory
+    fn mkdir(
+        &mut self,
+        dir_path: &str,
+        attrs: &Attrs,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer MkDir operation not defined: dir_path = {:?}, \
+                attrs = {:?}",
+                dir_path,
+                attrs
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Removes a directory, which must be empty
+    fn rmdir(
+        &mut self,
+        dir_path: &str,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer RmDir operation not defined: dir_path = {:?}",
+                dir_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Renames a file or directory
+    ///
+    /// SFTP version 3 requires that this fails when `new_path` already
+    /// exists.
+    fn rename(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer Rename operation not defined: old_path = {:?}, \
+                new_path = {:?}",
+                old_path,
+                new_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Returns the target of a symbolic link
+    ///
+    /// The returned [`NameEntry`] carries the link target as its filename.
+    fn readlink(
+        &mut self,
+        file_path: &str,
+    ) -> impl core::future::Future<Output = SftpOpResult<NameEntry<'_>>> {
+        async move {
+            log::error!(
+                "SftpServer ReadLink operation not defined: file_path = {:?}",
+                file_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    /// Creates a symbolic link at `link_path` pointing at `target_path`
+    fn symlink(
+        &mut self,
+        target_path: &str,
+        link_path: &str,
+    ) -> impl core::future::Future<Output = SftpOpResult<()>> {
+        async move {
+            log::error!(
+                "SftpServer Symlink operation not defined: target_path = {:?}, \
+                link_path = {:?}",
+                target_path,
+                link_path
+            );
+            Err(StatusCode::SSH_FX_OP_UNSUPPORTED)
+        }
+    }
 }
