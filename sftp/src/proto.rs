@@ -576,8 +576,12 @@ pub struct Attrs {
     pub permissions: Option<u32>,
     pub atime: Option<u32>,
     pub mtime: Option<u32>,
+    /// Number of extended attributes that were received.
+    ///
+    /// The extended attributes themselves are discarded, Sunset has no
+    /// use for them. This is not encoded when sending, so a decoded
+    /// `Attrs` that is sent on again loses them.
     pub ext_count: Option<u32>,
-    // TODO extensions
 }
 
 /// For more information see [File Attributes](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#autoid-5)
@@ -685,8 +689,18 @@ impl<'de> SSHDecode<'de> for Attrs {
             attrs.atime = Some(u32::dec(s)?);
             attrs.mtime = Some(u32::dec(s)?);
         }
-        // TODO Implement extensions
-        // if flags & AttrsFlags::SSH_FILEXFER_ATTR_EXTENDED != 0{
+        if flags & AttrsFlags::SSH_FILEXFER_ATTR_EXTENDED != 0 {
+            // The extensions are discarded, but must be consumed so
+            // that the rest of the packet still decodes. A bogus count
+            // runs out of input, `take()` limits it.
+            let count = u32::dec(s)?;
+            for _ in 0..count {
+                // extended_type and extended_data
+                let _ = BinString::dec(s)?;
+                let _ = BinString::dec(s)?;
+            }
+            attrs.ext_count = Some(count);
+        }
 
         Ok(attrs)
     }
@@ -1129,6 +1143,28 @@ mod proto_tests {
         let (a_r, l_r) = sshwire::read_ssh::<Attrs>(&sl, None).unwrap();
         assert_eq!(attr_read_only, a_r);
         assert_eq!(len, l_r);
+    }
+
+    #[test]
+    fn test_attributes_extended_are_consumed() {
+        // size, plus two extended attributes
+        let buf: [u8; 42] = [
+            0x80, 0, 0, 0x01, //                        SIZE | EXTENDED
+            0, 0, 0, 0, 0, 0, 0, 7, //                  size
+            0, 0, 0, 2, //                              extended count
+            0, 0, 0, 2, b'a', b'b', //                  type
+            0, 0, 0, 1, b'c', //                        data
+            0, 0, 0, 3, b'd', b'e', b'f', //            type
+            0, 0, 0, 0, //                              empty data
+            0xde, 0xad, 0xbe, 0xef, //                  trailing, not ours
+        ];
+
+        let (attrs, len) = sshwire::read_ssh::<Attrs>(&buf, None).unwrap();
+        assert_eq!(attrs.size, Some(7));
+        assert_eq!(attrs.ext_count, Some(2));
+        // Everything but the trailing bytes was consumed, so a packet
+        // carrying extended attributes still decodes.
+        assert_eq!(len, buf.len() - 4);
     }
 
     #[test]

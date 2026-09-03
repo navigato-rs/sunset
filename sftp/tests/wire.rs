@@ -215,6 +215,34 @@ fn oversized_data_response_is_refused() {
 }
 
 #[test]
+fn attrs_response_with_extended_attributes() {
+    let (s, mut client) = Scripted::new(&[]);
+
+    let mut body = vec![105u8];
+    body.extend_from_slice(&1u32.to_be_bytes());
+    // SSH_FILEXFER_ATTR_SIZE | PERMISSIONS | EXTENDED
+    body.extend_from_slice(&0x8000_0005u32.to_be_bytes());
+    body.extend_from_slice(&42u64.to_be_bytes());
+    body.extend_from_slice(&0o644u32.to_be_bytes());
+    body.extend_from_slice(&2u32.to_be_bytes());
+    for (ty, data) in [(&b"x@example.com"[..], &b"1"[..]), (b"y@example.com", b"")] {
+        body.extend_from_slice(&string(ty));
+        body.extend_from_slice(&string(data));
+    }
+    s.to_client.push(&packet(body));
+    s.to_client.push(&status_packet(2, 0));
+
+    let a = run_test(client.stat("/f")).expect("stat");
+    assert_eq!(a.size, Some(42));
+    assert_eq!(a.permissions, Some(0o644));
+    // Recorded, but the values themselves are discarded
+    assert_eq!(a.ext_count, Some(2));
+
+    // The extended attributes were consumed, not left in the stream
+    run_test(client.remove("/f")).expect("remove");
+}
+
+#[test]
 fn interrupted_request_poisons_the_client() {
     let (s, mut client) = Scripted::new(&[]);
 
