@@ -826,7 +826,7 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         self.finish(r).await
     }
 
-    /// The body of [`write()`](Self::write), with requests pipelined.
+    /// The body of [`write()`](Self::write), one request at a time.
     async fn write_chunks(
         &mut self,
         handle: &RemoteHandle,
@@ -837,64 +837,27 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         // A zero length write is still a request
         let chunks = data.len().div_ceil(chunk).max(1);
 
-        let mut inflight: [Option<ReqId>; PIPELINE] = [None; PIPELINE];
-        let mut n_inflight = 0;
-        let mut next = 0;
-        let mut failed = None;
-
-        loop {
-            while n_inflight < PIPELINE && next < chunks && failed.is_none() {
-                let pos = next * chunk;
-                let len = (data.len() - pos).min(chunk);
-                let id = self.next_id();
-                self.send_write(
-                    handle,
-                    id,
-                    offset + pos as u64,
-                    &data[pos..pos + len],
-                )
+        for n in 0..chunks {
+            let pos = n * chunk;
+            let len = (data.len() - pos).min(chunk);
+            let id = self.next_id();
+            self.send_write(handle, id, offset + pos as u64, &data[pos..pos + len])
                 .await?;
 
-                // OK unwrap, n_inflight counts the used slots
-                let slot = inflight.iter_mut().find(|s| s.is_none()).unwrap();
-                *slot = Some(id);
-                n_inflight += 1;
-                next += 1;
-            }
-
-            if n_inflight == 0 {
-                break;
-            }
-
-            let (ty, id) = self.recv_any().await?;
-            let Some(slot) = inflight.iter_mut().find(|s| **s == Some(id)) else {
-                debug!("Response for unknown {:?}", id);
-                return Err(SftpError::BadResponse);
-            };
-            *slot = None;
-            n_inflight -= 1;
-
-            match ty {
+            let r = match self.recv(id).await? {
                 SftpNum::SSH_FXP_STATUS => {
-                    if let Err(e) =
-                        Self::status_result(self.recv_status_body().await?)
-                    {
-                        failed = failed.or(Some(e));
-                    }
+                    Self::status_result(self.recv_status_body().await?)
                 }
                 ty => {
                     debug!("Unexpected {:?} response to a write request", ty);
-                    failed = failed.or(Some(SftpError::BadResponse));
+                    Err(SftpError::BadResponse)
                 }
-            }
-
+            };
+            // Leave the stream at a packet boundary either way
             drain(&mut self.reader, &mut self.pkt_remaining).await?;
+            r?;
         }
-
-        match failed {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Sends one `SSH_FXP_WRITE`.

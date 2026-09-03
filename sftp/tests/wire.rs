@@ -316,17 +316,18 @@ fn eof_on_the_first_chunk() {
 }
 
 /// Writes longer than `MAX_WRITE_LEN` are split into several requests.
+///
+/// Unlike reads these are sent one at a time, see `SftpClient::write`.
 #[test]
-fn writes_are_chunked_and_pipelined() {
+fn writes_are_chunked() {
     let (s, mut client) = Scripted::new(&[]);
     let h = open_file(&s, &mut client);
 
     let chunk = client::MAX_WRITE_LEN as usize;
     let data = vec![0x5a; chunk + 7];
 
-    // Replies in reverse, as for reads
-    s.to_client.push(&status_packet(3, 0));
     s.to_client.push(&status_packet(2, 0));
+    s.to_client.push(&status_packet(3, 0));
 
     run_test(client.write(&h, 64, &data)).expect("write");
 
@@ -350,8 +351,8 @@ fn writes_are_chunked_and_pipelined() {
     assert_eq!(seen, [(2, 64, chunk), (3, 64 + chunk as u64, 7)]);
 }
 
-/// A failure on one chunk of a write fails the whole write, and the
-/// remaining replies are consumed so the session survives.
+/// A failure on one chunk fails the whole write, leaving the session
+/// usable.
 #[test]
 fn a_failed_write_chunk_fails_the_write() {
     let (s, mut client) = Scripted::new(&[]);
@@ -371,6 +372,40 @@ fn a_failed_write_chunk_fails_the_write() {
     // Still usable
     s.to_client.push(&status_packet(4, 0));
     run_test(client.close(&h)).expect("close");
+}
+
+/// Writes wait for each reply, so only one request is ever outstanding.
+///
+/// A peer with a small channel window can otherwise deadlock: a client
+/// blocked part way through sending isn't reading, so it can't process
+/// the window adjustment that would let it continue.
+#[test]
+fn writes_are_not_pipelined() {
+    let (s, mut client) = Scripted::new(&[]);
+    let h = open_file(&s, &mut client);
+
+    let chunk = client::MAX_WRITE_LEN as usize;
+    let data = vec![0u8; 3 * chunk];
+
+    // Only the first chunk can be answered
+    s.to_client.push(&status_packet(2, 0));
+    {
+        let mut fut = pin!(client.write(&h, 0, &data));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+    }
+
+    // Two chunks were sent: the second only after the first was answered
+    let sent = s.from_client.take();
+    let mut count = 0;
+    let mut p = 0;
+    while p < sent.len() {
+        let len = u32::from_be_bytes(sent[p..p + 4].try_into().unwrap()) as usize;
+        assert_eq!(sent[p + 4], 6, "expected SSH_FXP_WRITE");
+        count += 1;
+        p += 4 + len;
+    }
+    assert_eq!(count, 2, "one outstanding write at a time");
 }
 
 #[test]

@@ -7,9 +7,12 @@
 - A SFTP client, `sunset_sftp::client::SftpClient`. It covers the
   version 3 requests, streaming file contents and directory listings
   rather than buffering them. Reads and writes larger than one packet
-  are split into `MAX_READ_LEN`/`MAX_WRITE_LEN` requests and pipelined
-  `PIPELINE_DEPTH` deep, so a transfer isn't limited to one block per
-  round trip.
+  are split into `MAX_READ_LEN`/`MAX_WRITE_LEN` requests, and reads are
+  pipelined `PIPELINE_DEPTH` deep so a download isn't limited to one
+  block per round trip. Writes wait for each reply; sending ahead
+  deadlocks against a peer with a small channel window, since a client
+  blocked part way through sending isn't reading, and so can't process
+  the window adjustment that would let it continue.
 
 - `SftpServer` handles more requests: `SSH_FXP_FSTAT`, `SSH_FXP_SETSTAT`,
   `SSH_FXP_FSETSTAT`, `SSH_FXP_REMOVE`, `SSH_FXP_MKDIR`, `SSH_FXP_RMDIR`,
@@ -47,6 +50,13 @@
   `SSH_FX_NO_SUCH_FILE` from other failures.
 
 ### Fixed
+
+- The server's input queue is now sized from the channel's receive
+  window rather than an estimate of five pipelined requests. A client
+  with more read requests outstanding than the queue could hold left
+  unread channel data in the Sunset core, which stopped it processing
+  the window adjustment the server was waiting for, deadlocking the
+  transfer.
 
 - `Attrs` decoding now consumes extended attributes rather than stopping
   at them. Previously a peer that sent any extended attribute had its

@@ -57,17 +57,19 @@ enum HandlerState {
 /// By adding a queue, the packets being processed can be drained allowing
 /// sunset core process the send window adjust, allowing responses to be sent.
 ///
-/// OpenSSH sftp client keeps 64 pipelined 32768 byte read requests.
-/// It sends a window adjust every 3*32768 bytes received,
-/// so we allow to receive a buffer of 5 read requests for some leeway
-/// (also for BBQueue wraparound behaviour).
-/// 30 is the size of a Read SFTP packet including all headers.
-/// There may be other other pathological cases, in theory up to
-/// TrafIn.buf.len() bytes might need to be buffered by SFTP.
+/// The queue must hold everything a peer can have in flight, otherwise
+/// the deadlock returns in a subtler form. If it fills, this reads no
+/// further, which leaves unread channel data in the Sunset core; that
+/// in turn stops it processing later packets, including the window
+/// adjust it is waiting for. Clients pipeline requests, so this is
+/// reached in practice: a client with several read requests
+/// outstanding wedges a queue sized for fewer.
 ///
-/// The deadlock can be reproduced with
-/// demo/sftp/std/testing/test_get_file_long.sh
-const INPUT_BUF: usize = 30 * 5;
+/// A peer can't send more than the channel's receive window before
+/// waiting for an adjustment, so a queue that size can always be
+/// drained. Read requests are around 30 bytes, so this is dozens of
+/// them.
+const INPUT_BUF: usize = sunset::config::DEFAULT_WINDOW;
 
 /// A SFTP server implementation.
 ///
