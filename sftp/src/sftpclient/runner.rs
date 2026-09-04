@@ -343,40 +343,67 @@ impl<const REQ_BUF: usize, const RESP_BUF: usize> SftpRunner<REQ_BUF, RESP_BUF> 
         }
     }
 
-    /// Where to read the next bytes from the peer into.
-    ///
-    /// Read up to this many bytes, then say how many arrived with
-    /// [`input_done()`](Self::input_done). Nothing is copied on the way
-    /// in, the reply is assembled where it lands.
-    ///
-    /// Empty when the runner has something for the caller to deal with
-    /// first: an event waiting for [`event()`](Self::event), or file
-    /// data waiting for [`recv_data()`](Self::recv_data).
-    pub fn input_buf(&mut self) -> &mut [u8] {
-        self.apply_advance();
+    /// How many bytes the runner wants next, the length of
+    /// [`want_buf()`](Self::want_buf).
+    fn want(&self) -> usize {
         if self.ready || self.recv_data > 0 {
-            return &mut self.inb[..0];
+            return 0;
         }
-
         if self.in_state == In::Drain {
-            // Overwritten and discarded, however much of it there is
-            let want = self.in_need.saturating_sub(self.in_pos);
-            return &mut self.inb[..want.min(RESP_BUF)];
+            return self.in_need.saturating_sub(self.in_pos).min(RESP_BUF);
         }
         // A reply too long for the buffer is drained instead, so this
         // fits by the time the state is entered.
-        let end = self.in_need.min(RESP_BUF);
-        &mut self.inb[self.in_pos.min(end)..end]
+        self.in_need.min(RESP_BUF).saturating_sub(self.in_pos)
+    }
+
+    /// Where to read the next bytes from the peer into.
+    ///
+    /// This is **exactly the bytes the runner wants next**, not spare
+    /// capacity: its length is how much of the current reply is still
+    /// missing, often just the 9 bytes of a header. Read at most that
+    /// many bytes, into this slice, then say how many arrived with
+    /// [`input_done()`](Self::input_done).
+    ///
+    /// Reading into somewhere else and reporting the count here loses
+    /// those bytes, so pass this slice to the transport rather than
+    /// copying into it afterwards. Nothing is copied on the way in, the
+    /// reply is assembled where it lands.
+    ///
+    /// Empty when the runner has something for the caller to deal with
+    /// first: an event waiting for [`event()`](Self::event), or file
+    /// data waiting for [`recv_data()`](Self::recv_data). Reading in
+    /// that case would block for something that has already arrived.
+    #[must_use]
+    pub fn want_buf(&mut self) -> &mut [u8] {
+        self.apply_advance();
+        let n = self.want();
+        if self.in_state == In::Drain {
+            // Overwritten and discarded, however much of it there is
+            return &mut self.inb[..n];
+        }
+        let start = self.in_pos.min(RESP_BUF);
+        &mut self.inb[start..start + n]
     }
 
     /// Records that `n` bytes arrived in
-    /// [`input_buf()`](Self::input_buf).
+    /// [`want_buf()`](Self::want_buf).
+    ///
+    /// Fails with `BadUsage` if `n` is more than that slice was long.
+    /// Silently ignoring the excess would drop bytes and desynchronise
+    /// the stream some replies later.
     pub fn input_done(&mut self, n: usize) -> SftpResult<()> {
+        self.apply_advance();
         if n == 0 {
             return Ok(());
         }
-        self.in_pos = (self.in_pos + n).min(self.in_need);
-        if self.in_pos == self.in_need {
+        let want = self.want();
+        if n > want {
+            debug!("input_done({}) but only {} bytes were wanted", n, want);
+            return Err(sunset::error::BadUsage.build().into());
+        }
+        self.in_pos += n;
+        if self.in_pos >= self.in_need {
             self.step()?;
         }
         Ok(())
@@ -384,14 +411,14 @@ impl<const REQ_BUF: usize, const RESP_BUF: usize> SftpRunner<REQ_BUF, RESP_BUF> 
 
     /// Feeds bytes from the peer, returning how many were used.
     ///
-    /// A copying convenience over [`input_buf()`](Self::input_buf) for
+    /// A copying convenience over [`want_buf()`](Self::want_buf) for
     /// callers that already hold the bytes.
     ///
     /// Returns 0 while an event is waiting to be collected with
     /// [`event()`](Self::event), or while file data is waiting to be
     /// taken with [`recv_data()`](Self::recv_data).
     pub fn input(&mut self, buf: &[u8]) -> SftpResult<usize> {
-        let dest = self.input_buf();
+        let dest = self.want_buf();
         let n = dest.len().min(buf.len());
         if n == 0 {
             return Ok(0);
@@ -922,12 +949,23 @@ impl<const REQ_BUF: usize, const RESP_BUF: usize> SftpRunner<REQ_BUF, RESP_BUF> 
     /// The data itself is not held here. After the header has been sent,
     /// [`send_data()`](Self::send_data) reports how much payload the
     /// caller must send.
+    ///
+    /// `len` may be at most [`MAX_WRITE_LEN`], otherwise
+    /// [`SftpError::NoRoom`] is returned. Split a longer write into
+    /// several requests.
     pub fn write(
         &mut self,
         handle: &[u8],
         offset: u64,
         len: usize,
     ) -> SftpResult<ReqId> {
+        if len > MAX_WRITE_LEN as usize {
+            // Servers are only required to accept packets up to 34000
+            // bytes, so a longer write is refused here rather than
+            // having the peer drop the channel partway through it.
+            debug!("Write of {} is beyond MAX_WRITE_LEN {}", len, MAX_WRITE_LEN);
+            return Err(SftpError::NoRoom);
+        }
         self.ready_to_send()?;
         let id = self.next_id();
         let body_len = 1 + 4 + 4 + handle.len() + 8 + 4 + len;
@@ -1388,6 +1426,49 @@ mod tests {
             }
         });
         assert_eq!(next, Some(ReqId(8)));
+    }
+
+    /// A write beyond what servers must accept is refused here, rather
+    /// than by the peer dropping the channel partway through it.
+    #[test]
+    fn an_oversized_write_is_refused() {
+        let mut r = R::new();
+        init(&mut r, &[]);
+
+        let too_big = MAX_WRITE_LEN as usize + 1;
+        assert!(matches!(r.write(b"abcd", 0, too_big), Err(SftpError::NoRoom)));
+        // and nothing was queued for it
+        assert!(r.output_done());
+        assert_eq!(r.outstanding(), 0);
+
+        // The largest allowed write is still fine
+        r.write(b"abcd", 0, MAX_WRITE_LEN as usize).unwrap();
+        let n = r.output_buf().len();
+        r.consume_output(n);
+        assert_eq!(r.send_data(), Some(MAX_WRITE_LEN as usize));
+    }
+
+    /// Claiming more input than was asked for used to be clamped, which
+    /// dropped the excess and desynchronised the stream a few replies
+    /// later rather than where the mistake was.
+    #[test]
+    fn over_reporting_input_is_refused() {
+        let mut r = R::new();
+        r.init().unwrap();
+        let n = r.output_buf().len();
+        r.consume_output(n);
+
+        // The header is wanted first, and nothing more
+        assert_eq!(r.want_buf().len(), SFTP_MINIMUM_PACKET_LEN);
+        assert!(r.input_done(SFTP_MINIMUM_PACKET_LEN + 1).is_err());
+
+        // The runner is unmoved, and a correct sequence still works
+        assert_eq!(r.want_buf().len(), SFTP_MINIMUM_PACKET_LEN);
+        let v = version_packet(&[]);
+        let n = r.input(&v).expect("input");
+        assert!(n > 0);
+        let _ = feed(&mut r, &v[n..], |_| ());
+        assert_eq!(r.version(), Some(3));
     }
 
     /// Requests are counted until their reply has been fully read, so

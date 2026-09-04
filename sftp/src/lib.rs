@@ -51,7 +51,7 @@
 //!     }
 //!
 //!     while !sftp.has_event() {
-//!         let got = recv(sftp.input_buf());
+//!         let got = recv(sftp.want_buf());
 //!         sftp.input_done(got)?;
 //!     }
 //!     Ok(match sftp.event() {
@@ -205,6 +205,7 @@ pub mod protocol {
     pub use crate::proto::OpaqueHandle;
     pub use crate::proto::PFlags;
     pub use crate::proto::PathInfo;
+    pub use crate::proto::Rename;
     pub use crate::proto::SftpPacket;
     pub use crate::proto::StatusCode;
     pub use crate::sftpsink::SftpSink;

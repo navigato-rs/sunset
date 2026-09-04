@@ -255,7 +255,7 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
 
     /// Reads more of the peer's reply into the runner.
     async fn fill(&mut self) -> SftpResult<()> {
-        let dest = self.runner.input_buf();
+        let dest = self.runner.want_buf();
         if dest.is_empty() {
             // Something is waiting for the caller, reading would block
             // for a reply that has already arrived.
