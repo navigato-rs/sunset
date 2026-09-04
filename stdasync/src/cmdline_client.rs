@@ -325,9 +325,10 @@ impl CmdlineClient {
                         ) {
                             Ok(()) => h.accept()?,
                             Err(e) => {
-                                h.reject()?;
-                                // Otherwise the session fails later with
-                                // something that doesn't say why.
+                                // reject() reports the rejection as an
+                                // error of its own, which says nothing
+                                // about why. Discard it and explain.
+                                let _ = h.reject();
                                 warn!("Host key rejected: {e:?}");
                                 return Err(Error::msg(
                                     "host key verification failed",
