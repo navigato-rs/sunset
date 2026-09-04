@@ -3239,7 +3239,6 @@ dependencies = [
  "sunset",
  "sunset-async",
  "sunset-sftp",
- "sunset-sshwire-derive",
  "time",
  "tokio",
  "whoami",
