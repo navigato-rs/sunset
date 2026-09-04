@@ -110,6 +110,9 @@ ecdsa256 = ["_ecdsa", "dep:p256", "ssh-key?/p256"]
 openssh-key = ["ssh-key"]
 # implements embedded_io::Error for sunset::Error
 embedded-io = ["dep:embedded-io"]
+
+# SSH agent protocol encoding and decoding, without IO. See `agent`.
+agent = []
 # Arbitrary for fuzzing. std is required for derive(Arbitrary)
 arbitrary = ["dep:arbitrary", "std"]
 

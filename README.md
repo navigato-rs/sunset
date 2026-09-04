@@ -52,6 +52,9 @@ Working:
 - SFTP server and client
 - Client `direct-tcpip` (local TCP forward, the channel behind `ssh -L` / `ssh -J`)
 - Agent-held `sk-ssh-ed25519@openssh.com` keys (signing stays in the agent)
+- SSH agent protocol encoding and decoding without IO, `sunset::agent` behind the
+  `agent` feature. The socket is the caller's, so a Windows named pipe agent is
+  as reachable as a Unix one.
 - Up to 16 concurrent channels
 - Client-initiated channel EOF, so remote commands reading stdin can finish
 

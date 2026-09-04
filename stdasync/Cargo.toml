@@ -7,8 +7,7 @@ license = "0BSD"
 description = "Sunset SSH for larger systems"
 
 [dependencies]
-sunset = { workspace = true, features = ["std", "openssh-key"] }
-sunset-sshwire-derive.workspace = true
+sunset = { workspace = true, features = ["std", "openssh-key", "agent"] }
 sunset-async.workspace = true
 
 log = { workspace = true, features = ["release_max_level_trace"] }
