@@ -1,5 +1,8 @@
 //! Runs [`SftpClient`] against [`SftpServerHandler`] over an in-memory
 //! pipe, with a small in-memory filesystem behind the server.
+//!
+//! Needs the async layer, so this file is empty without it.
+#![cfg(feature = "async")]
 
 mod common;
 

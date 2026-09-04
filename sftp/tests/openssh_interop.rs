@@ -3,6 +3,9 @@
 //! Skipped when OpenSSH isn't installed, so this doesn't have to be a
 //! build dependency. On Debian and Ubuntu the binary is in the
 //! `openssh-sftp-server` package.
+//!
+//! Needs the async layer, so this file is empty without it.
+#![cfg(feature = "async")]
 
 mod common;
 

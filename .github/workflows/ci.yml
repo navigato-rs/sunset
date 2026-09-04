@@ -40,3 +40,9 @@ jobs:
         run: |
           cargo test --workspace --exclude sunset-demo-picow --exclude sunset-fuzz
           cargo test -p sunset --all-features
+
+      # The SFTP protocol core must stay free of async, so that it can be
+      # driven from a blocking loop. This fails if anything in it grows a
+      # dependency on the async layer.
+      - name: Test sunset-sftp without async
+        run: cargo test -p sunset-sftp --no-default-features

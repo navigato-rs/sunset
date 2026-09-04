@@ -17,14 +17,56 @@ use sunset::sshwire::{self, BinString, SSHEncode, TextString};
 
 use crate::error::{SftpError, SftpResult};
 use crate::proto::{
-    Attrs, AttrsFlags, Extensions, InitVersionClient, ReqId,
-    SFTP_MAXIMUM_PACKET_LEN, SFTP_MINIMUM_PACKET_LEN, SFTP_VERSION, SftpNum,
+    Attrs, AttrsFlags, Extensions, InitVersionClient, MAX_PATH_LEN, MAX_REQUEST_LEN,
+    ReqId, SFTP_MAXIMUM_PACKET_LEN, SFTP_MINIMUM_PACKET_LEN, SFTP_VERSION, SftpNum,
     SftpPacket, StatusCode,
 };
 use crate::sftpsink::SftpSink;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, log, trace, warn};
+
+/// Largest directory entry the client can decode.
+///
+/// A filename, the server's `ls -l` style long name, and attributes.
+pub const MAX_DIR_ENTRY_LEN: usize = 2 * (4 + MAX_PATH_LEN) + 128;
+
+const fn larger(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// Default response buffer size for a client.
+///
+/// Large enough for the largest directory entry a server can send,
+/// which is the biggest thing that has to be buffered.
+pub const DEFAULT_CLIENT_BUF: usize = larger(MAX_REQUEST_LEN, MAX_DIR_ENTRY_LEN);
+
+/// Largest `SSH_FXP_READ` that will be requested in one request.
+///
+/// Matches the OpenSSH client, and keeps a data response within the
+/// 34000 byte packet size that draft-ietf-secsh-filexfer-02 requires
+/// servers to accept. Larger reads are split into several requests.
+pub const MAX_READ_LEN: u32 = 32 * 1024;
+
+/// Largest `SSH_FXP_WRITE` that will be sent in one request.
+///
+/// Servers commonly refuse packets beyond the 34000 bytes the draft
+/// requires them to accept. Larger writes are split into several
+/// requests.
+pub const MAX_WRITE_LEN: u32 = 32 * 1024;
+
+/// Flags for [`SftpRunner::open`] and [`SftpClient::open`](super::SftpClient::open).
+///
+/// See [Opening, creating and closing files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.3).
+#[allow(missing_docs)]
+pub mod pflags {
+    pub const READ: u32 = 0x00000001;
+    pub const WRITE: u32 = 0x00000002;
+    pub const APPEND: u32 = 0x00000004;
+    pub const CREAT: u32 = 0x00000008;
+    pub const TRUNC: u32 = 0x00000010;
+    pub const EXCL: u32 = 0x00000020;
+}
 
 /// Something the peer said.
 ///

@@ -29,8 +29,10 @@ A SSH client and server implementation. This is a fork of
 - [`sunset-sftp`](sftp/) implements an SFTP server and client. An example of the
   application side is in [demo/sftp/std](demo/sftp/std). The client's core,
   `SftpRunner`, performs no IO of its own, the same as `sunset::Runner`;
-  `SftpClient` is the `embedded_io_async` wrapper over it. `sunset-sftp` is
-  currently under development, treat as alpha status.
+  `SftpClient` is the `embedded_io_async` wrapper over it. With
+  `default-features = false` the async layers are left out and the crate has no
+  async dependencies at all. `sunset-sftp` is currently under development, treat
+  as alpha status.
 
 ## SSH Features
 

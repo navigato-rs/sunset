@@ -1,9 +1,7 @@
-use crate::{
-    error::{SftpError, SftpResult},
-    proto::SFTP_FIELD_LEN_LENGTH,
-};
+#[cfg(feature = "async")]
+use crate::error::{SftpError, SftpResult};
+use crate::proto::SFTP_FIELD_LEN_LENGTH;
 
-use embedded_io_async::Write;
 use sunset::sshwire::{SSHSink, WireError};
 
 #[allow(unused_imports)]
@@ -63,7 +61,11 @@ impl<'g> SftpSink<'g> {
     /// Send current payload to a `Write` instance
     ///
     /// Returns the length sent
-    pub async fn send<W: Write>(self, mut w: W) -> SftpResult<u32> {
+    #[cfg(feature = "async")]
+    pub async fn send<W: embedded_io_async::Write>(
+        self,
+        mut w: W,
+    ) -> SftpResult<u32> {
         let s = self.payload_slice();
         w.write_all(s).await.map_err(SftpError::from_embedded_io)?;
         Ok(s.len() as u32)

@@ -1,5 +1,8 @@
 //! Checks the bytes a [`SftpClient`] puts on the wire, and how it
 //! handles responses that a cooperating server wouldn't produce.
+//!
+//! Needs the async layer, so this file is empty without it.
+#![cfg(feature = "async")]
 
 mod common;
 
