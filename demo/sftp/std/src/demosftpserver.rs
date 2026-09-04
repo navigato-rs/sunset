@@ -481,6 +481,18 @@ impl SftpServer for DemoSftpServer {
             let encoded_length = name_entry_collection.encoded_length();
             let items_count = name_entry_collection.count();
 
+            // An empty directory is the end of the listing. This has to
+            // be decided before any header goes out: a readdir is
+            // answered by a name reply or by a status, never both.
+            if items_count == 0 {
+                dir.read_status = ReadStatus::EndOfFile;
+                let finish_token = reply.send_eof().await.map_err(|error| {
+                    error!("{:?}", error);
+                    StatusCode::SSH_FX_FAILURE
+                })?;
+                return Ok(finish_token);
+            }
+
             let data_reply = reply
                 .send_header(encoded_length, items_count)
                 .await
@@ -567,13 +579,16 @@ impl SftpServer for DemoSftpServer {
 
     async fn remove(&mut self, file_path: &str) -> SftpOpResult<()> {
         debug!("Remove {:?}", file_path);
-        let validated = self.validate(file_path)?;
-        if validated.is_dir() {
+        // Not validate(): removing a symbolic link removes the link, not
+        // whatever it points at, and a dangling one is still removable.
+        let path = self.validate_nofollow(file_path)?;
+        let meta = fs::symlink_metadata(&path).map_err(map_io_error)?;
+        if meta.is_dir() {
             // SSH_FXP_REMOVE is for files, SSH_FXP_RMDIR removes
             // directories.
             return Err(StatusCode::SSH_FX_FAILURE);
         }
-        validated.remove_file().map_err(map_io_error)
+        fs::remove_file(&path).map_err(map_io_error)
     }
 
     async fn mkdir(&mut self, dir_path: &str, attrs: &Attrs) -> SftpOpResult<()> {
@@ -590,11 +605,14 @@ impl SftpServer for DemoSftpServer {
 
     async fn rmdir(&mut self, dir_path: &str) -> SftpOpResult<()> {
         debug!("RmDir {:?}", dir_path);
-        let validated = self.validate(dir_path)?;
-        if !validated.is_dir() {
+        // Not validate(): a symbolic link pointing at a directory is not
+        // a directory to remove.
+        let path = self.validate_nofollow(dir_path)?;
+        let meta = fs::symlink_metadata(&path).map_err(map_io_error)?;
+        if !meta.is_dir() {
             return Err(StatusCode::SSH_FX_FAILURE);
         }
-        validated.remove_dir().map_err(map_io_error)
+        fs::remove_dir(&path).map_err(map_io_error)
     }
 
     async fn rename(&mut self, old_path: &str, new_path: &str) -> SftpOpResult<()> {
@@ -674,6 +692,10 @@ impl SftpServer for DemoSftpServer {
         link_path: &str,
     ) -> SftpOpResult<()> {
         debug!("Symlink {:?} to {:?}", link_path, target_path);
+        // The target is resolved against the served directory and stored
+        // absolute, so a link can't be made to point outside it. A
+        // relative target therefore doesn't mean "beside the link", and
+        // the target has to exist already.
         let target = self.validate(target_path)?;
         // The link doesn't exist yet, and must not be resolved if it
         // does, so only its parent is validated.

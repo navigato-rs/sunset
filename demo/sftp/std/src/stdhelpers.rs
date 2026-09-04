@@ -125,9 +125,9 @@ impl DirEntriesCollection {
     where
         W: Write,
     {
-        if self.entries.is_empty() {
-            return Err(StatusCode::SSH_FX_EOF);
-        }
+        // Nothing may fail from here on: the header announcing these
+        // entries has already been sent, so an error would put a second
+        // reply on the wire for the same request.
 
         let Ok(token) = data_reply
             .send_data(|mut limited_dir_sender| async move {
