@@ -545,33 +545,32 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
 
     /// Receive data coming from the wire into this application.
     ///
-    /// Returns `Ok(len)` received, `Err(Error::ChannelEof)` on EOF,
-    /// or other errors. Ok(0) indicates no data available, ie pending.
-    /// TODO: EOF is unimplemented
+    /// Returns `Ok(len)` received, `Err(Error::ChannelEOF)` once the peer
+    /// has sent EOF, or other errors. `Ok(0)` indicates no data
+    /// available, ie pending.
     pub fn read_channel(
         &mut self,
         chan: &ChanHandle,
         dt: ChanData,
         buf: &mut [u8],
     ) -> Result<usize> {
-        if self.closed_input {
-            return error::ChannelEOF.fail();
-        }
-
         dt.validate_receive(CS::is_client())?;
-
-        if self.is_channel_eof(chan) {
-            return error::ChannelEOF.fail();
-        }
 
         let (len, complete) = self.traf_in.read_channel(chan.0, dt, buf);
         if let Some(x) = complete {
             self.finished_read_channel(chan, x)?;
         }
+        if len == 0 && self.is_channel_eof(chan) {
+            return error::ChannelEOF.fail();
+        }
         Ok(len)
     }
 
     /// Receives input data, either normal or extended.
+    ///
+    /// Reports the end of the channel the same way as
+    /// [`read_channel()`](Self::read_channel): `Err(Error::ChannelEOF)`
+    /// once the peer has sent EOF, `Ok((0, _))` while merely pending.
     pub fn read_channel_either(
         &mut self,
         chan: &ChanHandle,
@@ -580,6 +579,9 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         let (len, complete, dt) = self.traf_in.read_channel_either(chan.0, buf);
         if let Some(x) = complete {
             self.finished_read_channel(chan, x)?;
+        }
+        if len == 0 && self.is_channel_eof(chan) {
+            return error::ChannelEOF.fail();
         }
         Ok((len, dt))
     }
