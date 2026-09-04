@@ -1,28 +1,32 @@
 use core::fmt;
 
 use embedded_io_async::{Read, Write};
-use sunset::sshwire::{BinString, SSHEncode, TextString};
+use sunset::sshwire::{SSHEncode, TextString};
 
 use crate::error::{SftpError, SftpResult};
 use crate::proto::{
-    Attrs, Close, Extensions, FSetStat, FStat, Filename, InitVersionClient, LStat,
-    MAX_HANDLE_LEN, MAX_REQUEST_LEN, MkDir, OpaqueHandle, Open, OpenDir, PFlags,
-    PathInfo, ReadDir, ReadLink, Remove, Rename, ReqId, RmDir,
-    SFTP_MAXIMUM_PACKET_LEN, SFTP_MINIMUM_PACKET_LEN, SFTP_VERSION,
-    SSH_FXP_EXTENDED, SetStat, SftpNum, SftpPacket, Stat, StatusCode, Symlink,
+    Attrs, MAX_HANDLE_LEN, MAX_PATH_LEN, MAX_REQUEST_LEN, Rename, ReqId, StatusCode,
 };
 use crate::sftpclient::dir::DirIter;
-use crate::sftpclient::packetread::*;
-use crate::sftpsink::SftpSink;
+use crate::sftpclient::runner::{SftpEvent, SftpRunner};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, log, trace, warn};
 
-/// Default buffer size for [`SftpClient`].
+/// Largest directory entry the client can decode.
 ///
-/// Large enough for the longest request, which also leaves room for a
-/// directory entry's filename and a good part of its long name.
-pub const DEFAULT_CLIENT_BUF: usize = MAX_REQUEST_LEN;
+/// A filename, the server's `ls -l` style long name, and attributes.
+pub const MAX_DIR_ENTRY_LEN: usize = 2 * (4 + MAX_PATH_LEN) + 128;
+
+const fn larger(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// Default response buffer size for [`SftpClient`].
+///
+/// Large enough for the largest directory entry a server can send,
+/// which is the biggest thing that has to be buffered.
+pub const DEFAULT_CLIENT_BUF: usize = larger(MAX_REQUEST_LEN, MAX_DIR_ENTRY_LEN);
 
 /// Largest `SSH_FXP_READ` that will be requested in one request.
 ///
@@ -55,13 +59,6 @@ pub const PIPELINE_DEPTH: usize = 8;
 /// Shorthand within this module.
 const PIPELINE: usize = PIPELINE_DEPTH;
 
-/// Sanity limit for responses that are streamed rather than buffered.
-///
-/// `SSH_FXP_DATA` is bounded by [`MAX_READ_LEN`], but `SSH_FXP_NAME` for
-/// a large directory can exceed the usual packet limit. Nothing is
-/// buffered, so this is only a guard against a broken peer.
-const MAX_STREAM_PACKET_LEN: usize = 1024 * 1024;
-
 /// Flags for [`SftpClient::open`].
 ///
 /// See [Opening, creating and closing files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.3).
@@ -81,6 +78,27 @@ pub mod pflags {
 fn note_short(short: &mut Option<(usize, usize)>, idx: usize, len: usize) {
     if short.is_none_or(|(i, _)| idx < i) {
         *short = Some((idx, len));
+    }
+}
+
+/// Converts a status response to a result.
+fn status_result(code: StatusCode) -> SftpResult<()> {
+    match code {
+        StatusCode::SSH_FX_OK => Ok(()),
+        code => {
+            debug!("SFTP request failed: {:?}", code);
+            Err(SftpError::FileServerError(code))
+        }
+    }
+}
+
+/// Checks a reply belongs to the request that was made.
+fn check_id(got: ReqId, want: ReqId) -> SftpResult<()> {
+    if got == want {
+        Ok(())
+    } else {
+        debug!("Response for {:?}, expected {:?}", got, want);
+        Err(SftpError::BadResponse)
     }
 }
 
@@ -104,21 +122,24 @@ pub struct RemoteHandle {
 }
 
 impl RemoteHandle {
-    fn empty(kind: HandleKind) -> Self {
-        Self { handle: [0; MAX_HANDLE_LEN], len: 0, kind }
-    }
-
     /// True for handles from [`SftpClient::opendir`].
     pub fn is_dir(&self) -> bool {
         self.kind == HandleKind::Dir
     }
 
-    fn as_bytes(&self) -> &[u8] {
-        &self.handle[..self.len as usize]
+    fn new(handle: &[u8], kind: HandleKind) -> SftpResult<Self> {
+        if handle.is_empty() || handle.len() > MAX_HANDLE_LEN {
+            debug!("Server handle of {} bytes is unusable", handle.len());
+            return Err(SftpError::NoRoom);
+        }
+        let mut h =
+            Self { handle: [0; MAX_HANDLE_LEN], len: handle.len() as u16, kind };
+        h.handle[..handle.len()].copy_from_slice(handle);
+        Ok(h)
     }
 
-    fn opaque(&self) -> OpaqueHandle<'_> {
-        OpaqueHandle(BinString(self.as_bytes()))
+    fn as_bytes(&self) -> &[u8] {
+        &self.handle[..self.len as usize]
     }
 
     /// Checks the handle is the expected kind before using it.
@@ -141,6 +162,22 @@ impl fmt::Debug for RemoteHandle {
     }
 }
 
+/// A reply, reduced to something that doesn't borrow the runner.
+#[derive(Debug)]
+enum Reply {
+    Version(u32),
+    Handle(RemoteHandle),
+    Attrs(Attrs),
+    Status(StatusCode),
+    /// `len` bytes of file data follow, taken with `take_data()`
+    Data(usize),
+    /// A name reply of `count` entries begins
+    NameStart(u32),
+    /// One name entry, whose filename is `len` bytes long
+    Name(usize),
+    NameEnd,
+}
+
 /// A SFTP client.
 ///
 /// Wraps the [`Read`] and [`Write`] halves of a SSH channel that has had
@@ -148,46 +185,27 @@ impl fmt::Debug for RemoteHandle {
 ///
 /// [`init()`](Self::init) must be called once before any other request.
 ///
-/// `BUF` sizes the single internal buffer used to encode requests and to
-/// hold the variable length parts of a response. It must be at least
-/// [`MAX_REQUEST_LEN`]; [`DEFAULT_CLIENT_BUF`] is a reasonable choice and
-/// is used by [`new_default_buffer()`](Self::new_default_buffer).
-/// File contents and directory listings are streamed, so they are not
-/// limited by `BUF`.
+/// This is IO around [`SftpRunner`], which is the protocol itself.
+/// Anything that isn't `embedded_io_async` shaped can drive that
+/// directly instead.
 ///
-/// Requests are made one at a time; a request is written and its
-/// response read before the next is sent.
+/// `BUF` sizes the buffer that holds the parts of a reply which aren't
+/// file data: a handle, a status, one directory entry.
+/// [`DEFAULT_CLIENT_BUF`] fits the largest of those. File contents and
+/// directory listings are streamed, so they are not limited by `BUF`.
+///
+/// Requests are made one at a time, except within a single
+/// [`read()`](Self::read), which pipelines.
 pub struct SftpClient<R: Read, W: Write, const BUF: usize> {
     reader: R,
     writer: W,
-    buf: [u8; BUF],
+    pub(super) runner: SftpRunner<MAX_REQUEST_LEN, BUF>,
 
-    /// Next request id to use
-    next_id: u32,
-
-    /// Bytes of the current response packet that haven't been read yet.
+    /// Set while the position in the stream is unknown.
     ///
-    /// Left non-zero when a caller stops reading a response early, for
-    /// example dropping a [`DirIter`]. The next request drains it.
-    pkt_remaining: usize,
-
-    /// Requests that have been sent but whose response hasn't been read.
-    ///
-    /// More than one while a transfer is pipelining. Any left over are
-    /// discarded before the next operation.
-    outstanding: usize,
-
-    /// Set while the stream position is unknown.
-    ///
-    /// A request that is interrupted (its future dropped) or that fails
-    /// partway leaves the stream out of sync with the peer, so the client
-    /// refuses further requests rather than misinterpreting data.
+    /// Only while bytes are being moved: everything else the runner
+    /// holds, so an interrupted request no longer costs the session.
     poisoned: bool,
-
-    /// Negotiated version, once `init()` has completed.
-    version: Option<u32>,
-
-    extensions: Extensions,
 }
 
 impl<R: Read, W: Write> SftpClient<R, W, DEFAULT_CLIENT_BUF> {
@@ -202,31 +220,9 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
     ///
     /// [`init()`](Self::init) must be called before any request.
     ///
-    /// Panics if `BUF` is smaller than [`MAX_REQUEST_LEN`].
+    /// Panics if `BUF` is too small, see [`DEFAULT_CLIENT_BUF`].
     pub const fn new(reader: R, writer: W) -> Self {
-        // A const generic bound would be preferable, but const generic
-        // expressions aren't stable.
-        assert!(
-            BUF >= MAX_REQUEST_LEN,
-            "SftpClient BUF must be at least MAX_REQUEST_LEN"
-        );
-        Self {
-            reader,
-            writer,
-            buf: [0; BUF],
-            next_id: 1,
-            pkt_remaining: 0,
-            outstanding: 0,
-            poisoned: false,
-            version: None,
-            extensions: Extensions {
-                posix_rename: false,
-                hardlink: false,
-                fsync: false,
-                statvfs: false,
-                limits: false,
-            },
-        }
+        Self { reader, writer, runner: SftpRunner::new(), poisoned: false }
     }
 
     /// Returns the underlying channel halves.
@@ -236,378 +232,309 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
 
     /// The negotiated SFTP version, or `None` before [`init()`](Self::init).
     pub fn version(&self) -> Option<u32> {
-        self.version
+        self.runner.version()
     }
 
     /// Extensions announced by the server in its `SSH_FXP_VERSION`.
-    pub fn extensions(&self) -> Extensions {
-        self.extensions
+    pub fn extensions(&self) -> crate::proto::Extensions {
+        self.runner.extensions()
     }
 
-    // ===================== Request/response plumbing =====================
+    // ============================ Moving bytes ============================
 
-    /// Checks the client is usable, and discards anything left over
-    /// from a previous operation.
+    /// Sends what the runner has queued, then `data` if the request
+    /// carries a payload.
+    async fn send_out(&mut self, data: &[u8]) -> SftpResult<()> {
+        // A half sent request leaves the peer mid-packet, which nothing
+        // can recover from.
+        self.poisoned = true;
+        while !self.runner.output_buf().is_empty() {
+            let out = self.runner.output_buf();
+            let n =
+                self.writer.write(out).await.map_err(SftpError::from_embedded_io)?;
+            if n == 0 {
+                return Err(SftpError::Disconnected);
+            }
+            self.runner.consume_output(n);
+        }
+
+        if let Some(len) = self.runner.send_data() {
+            let len = len.min(data.len());
+            self.writer
+                .write_all(&data[..len])
+                .await
+                .map_err(SftpError::from_embedded_io)?;
+            self.runner.data_sent(len);
+        }
+        self.writer.flush().await.map_err(SftpError::from_embedded_io)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Reads more of the peer's reply into the runner.
+    async fn fill(&mut self) -> SftpResult<()> {
+        let dest = self.runner.input_buf();
+        if dest.is_empty() {
+            // Something is waiting for the caller, reading would block
+            // for a reply that has already arrived.
+            debug!("Nowhere to read into");
+            return Err(sunset::error::BadUsage.build().into());
+        }
+        let n = self.reader.read(dest).await.map_err(SftpError::from_embedded_io)?;
+        if n == 0 {
+            return Err(SftpError::Disconnected);
+        }
+        self.runner.input_done(n)
+    }
+
+    /// Reads until the runner has an event.
+    pub(super) async fn wait_event(&mut self) -> SftpResult<()> {
+        while !self.runner.has_event() {
+            self.fill().await?;
+        }
+        Ok(())
+    }
+
+    /// Takes file data straight into `dest`, without going through the
+    /// runner.
+    async fn take_data(&mut self, dest: &mut [u8]) -> SftpResult<()> {
+        // Data half read leaves the stream mid-packet.
+        self.poisoned = true;
+        let mut done = 0;
+        while done < dest.len() {
+            let n = self
+                .reader
+                .read(&mut dest[done..])
+                .await
+                .map_err(SftpError::from_embedded_io)?;
+            if n == 0 {
+                return Err(SftpError::Disconnected);
+            }
+            done += n;
+        }
+        self.runner.data_taken(dest.len());
+        self.poisoned = false;
+        Ok(())
+    }
+
+    // ========================= Request/reply flow =========================
+
+    /// The next reply, with any name entry copied into `out`.
     ///
-    /// The stream position is then unknown until the operation
-    /// finishes, so an interrupted operation leaves the client
-    /// unusable rather than misreading the next response.
-    async fn start(&mut self) -> SftpResult<()> {
+    /// The returned length is the entry's, which may be longer than
+    /// `out`; only what fits is copied.
+    async fn next_reply(&mut self, out: &mut [u8]) -> SftpResult<(ReqId, Reply)> {
+        self.wait_event().await?;
+        // OK unwrap, wait_event() only returns with one ready
+        let ev = self.runner.event().unwrap();
+        trace!("SFTP <---- {:?}", ev);
+        let r = match ev {
+            SftpEvent::Version { version } => (ReqId(0), Reply::Version(version)),
+            SftpEvent::Handle { id, handle } => {
+                (id, Reply::Handle(RemoteHandle::new(handle, HandleKind::File)?))
+            }
+            SftpEvent::Attrs { id, attrs } => (id, Reply::Attrs(attrs)),
+            SftpEvent::Status { id, code } => (id, Reply::Status(code)),
+            SftpEvent::Data { id, len } => (id, Reply::Data(len)),
+            SftpEvent::NameStart { id, count } => (id, Reply::NameStart(count)),
+            SftpEvent::Name { id, filename, .. } => {
+                let n = filename.len().min(out.len());
+                out[..n].copy_from_slice(&filename[..n]);
+                (id, Reply::Name(filename.len()))
+            }
+            SftpEvent::NameEnd { id } => (id, Reply::NameEnd),
+        };
+        Ok(r)
+    }
+
+    /// Takes file data the caller has nowhere to put.
+    ///
+    /// It still has to come off the stream, otherwise the next reply
+    /// can't be found.
+    async fn discard_data(&mut self) -> SftpResult<()> {
+        // Only for discarding, so any size does
+        let mut sink = [0u8; 256];
+        while let Some(len) = self.runner.recv_data() {
+            let n = len.min(sink.len());
+            self.take_data(&mut sink[..n]).await?;
+        }
+        Ok(())
+    }
+
+    /// Discards the replies to requests that were never read.
+    ///
+    /// A request whose future was dropped leaves its reply on the
+    /// stream; it has to come off before the next one makes sense.
+    async fn drain_replies(&mut self) -> SftpResult<()> {
+        while self.runner.outstanding() > 0 || self.runner.recv_data().is_some() {
+            if self.runner.recv_data().is_some() {
+                self.discard_data().await?;
+                continue;
+            }
+            let _ = self.next_reply(&mut []).await?;
+        }
+        Ok(())
+    }
+
+    /// Prepares for a new operation.
+    async fn begin(&mut self) -> SftpResult<()> {
         if self.poisoned {
-            debug!("SftpClient used after an interrupted request");
+            debug!("SftpClient used after an interrupted transfer");
             return Err(SftpError::Interrupted);
         }
-        if self.version.is_none() {
+        if self.runner.version().is_none() {
             return Err(SftpError::NotInitialized);
         }
-        self.drain_responses().await?;
-
-        self.poisoned = true;
-        Ok(())
+        self.drain_replies().await
     }
 
-    fn next_id(&mut self) -> ReqId {
-        let id = ReqId(self.next_id);
-        self.next_id = self.next_id.wrapping_add(1);
-        id
+    /// Sends the queued request and reads its `SSH_FXP_STATUS`.
+    async fn do_status(&mut self, id: ReqId) -> SftpResult<()> {
+        self.send_out(&[]).await?;
+        self.expect_status(id).await
     }
 
-    /// Starts an operation that makes a single request.
-    async fn begin(&mut self) -> SftpResult<ReqId> {
-        self.start().await?;
-        Ok(self.next_id())
-    }
-
-    /// Discards the rest of the current response, and the responses to
-    /// any requests that were not read.
-    async fn drain_responses(&mut self) -> SftpResult<()> {
-        drain(&mut self.reader, &mut self.pkt_remaining).await?;
-
-        while self.outstanding > 0 {
-            let mut lb = [0u8; 4];
-            read_exact(&mut self.reader, &mut lb).await?;
-            let len = u32::from_be_bytes(lb) as usize;
-            if len > MAX_STREAM_PACKET_LEN {
-                debug!("Discarded response length {} too long", len);
-                return Err(SftpError::MalformedPacket);
-            }
-            self.pkt_remaining = len;
-            self.outstanding -= 1;
-            drain(&mut self.reader, &mut self.pkt_remaining).await?;
-        }
-        Ok(())
-    }
-
-    /// Finishes an operation, discarding any responses not read.
-    ///
-    /// The client stays usable if the responses were consumed
-    /// successfully. `r` failing for a reason that leaves the stream
-    /// intact (an error status, a value too long for the buffer) is
-    /// still recoverable.
-    async fn finish<T>(&mut self, r: SftpResult<T>) -> SftpResult<T> {
-        match self.drain_responses().await {
-            Ok(()) => {
-                self.poisoned = false;
-                r
-            }
-            // Keep the earlier error, it explains the failure better.
-            Err(e) => Err(r.err().unwrap_or(e)),
-        }
-    }
-
-    /// Sends a request packet.
-    async fn send(&mut self, packet: &SftpPacket<'_>) -> SftpResult<()> {
-        trace!("SFTP ----> {:?}", packet);
-        {
-            let mut sink = SftpSink::new(&mut self.buf);
-            packet.encode_request(&mut sink)?;
-            let out = sink.used_slice();
-            self.writer.write_all(out).await.map_err(SftpError::from_embedded_io)?;
-        }
-        self.outstanding += 1;
-        self.writer.flush().await.map_err(SftpError::from_embedded_io)
-    }
-
-    /// Reads a response header, leaving `pkt_remaining` set to the
-    /// unread packet content.
-    ///
-    /// The request id is returned rather than checked, since several
-    /// requests may be in flight and a peer may answer them in any
-    /// order.
-    async fn recv_any(&mut self) -> SftpResult<(SftpNum, ReqId)> {
-        let mut lb = [0u8; 4];
-        read_exact(&mut self.reader, &mut lb).await?;
-        let len = u32::from_be_bytes(lb) as usize;
-
-        // Packet type and request id must be present.
-        if len < SFTP_MINIMUM_PACKET_LEN - 4 {
-            debug!("Response length {} too short", len);
-            return Err(SftpError::MalformedPacket);
-        }
-        self.pkt_remaining = len;
-        self.outstanding = self.outstanding.saturating_sub(1);
-
-        let ty =
-            SftpNum::from(take_u8(&mut self.reader, &mut self.pkt_remaining).await?);
-
-        let limit = match ty {
-            SftpNum::SSH_FXP_DATA | SftpNum::SSH_FXP_NAME => MAX_STREAM_PACKET_LEN,
-            _ => SFTP_MAXIMUM_PACKET_LEN,
-        };
-        if len > limit {
-            debug!("Response {:?} length {} too long", ty, len);
-            return Err(SftpError::MalformedPacket);
-        }
-
-        let id = ReqId(take_u32(&mut self.reader, &mut self.pkt_remaining).await?);
-
-        trace!("SFTP <---- {:?} {:?} {} bytes", ty, id, self.pkt_remaining);
-        Ok((ty, id))
-    }
-
-    /// Reads a response header, which must be for `expect`.
-    async fn recv(&mut self, expect: ReqId) -> SftpResult<SftpNum> {
-        let (ty, id) = self.recv_any().await?;
-        if id != expect {
-            // Only one request was made, so this is the peer
-            // misbehaving or a desynchronised stream.
-            debug!("Response for {:?}, expected {:?}", id, expect);
-            return Err(SftpError::BadResponse);
-        }
-        Ok(ty)
-    }
-
-    /// Reads a `SSH_FXP_STATUS` response body.
-    ///
-    /// The status message and language tag are discarded.
-    async fn recv_status_body(&mut self) -> SftpResult<StatusCode> {
-        let code = StatusCode::from(
-            take_u32(&mut self.reader, &mut self.pkt_remaining).await?,
-        );
-        // message and language tag
-        skip_string(&mut self.reader, &mut self.pkt_remaining).await?;
-        skip_string(&mut self.reader, &mut self.pkt_remaining).await?;
-        Ok(code)
-    }
-
-    /// Converts a status response to a result.
-    fn status_result(code: StatusCode) -> SftpResult<()> {
-        match code {
-            StatusCode::SSH_FX_OK => Ok(()),
-            code => {
-                debug!("SFTP request failed: {:?}", code);
-                Err(SftpError::FileServerError(code))
+    /// Reads a `SSH_FXP_STATUS` for `id`.
+    async fn expect_status(&mut self, id: ReqId) -> SftpResult<()> {
+        let (rid, r) = self.next_reply(&mut []).await?;
+        check_id(rid, id)?;
+        match r {
+            Reply::Status(code) => status_result(code),
+            r => {
+                debug!("Unexpected {:?} response to a status request", r);
+                Err(SftpError::BadResponse)
             }
         }
     }
 
-    /// Performs a request whose only response is `SSH_FXP_STATUS`.
-    async fn request_status(
+    /// Sends the queued request and reads its `SSH_FXP_HANDLE`.
+    async fn do_handle(
         &mut self,
         id: ReqId,
-        packet: SftpPacket<'_>,
-    ) -> SftpResult<()> {
-        let r = async {
-            self.send(&packet).await?;
-            match self.recv(id).await? {
-                SftpNum::SSH_FXP_STATUS => {
-                    Self::status_result(self.recv_status_body().await?)
-                }
-                ty => {
-                    debug!("Unexpected {:?} response to a status request", ty);
-                    Err(SftpError::BadResponse)
-                }
-            }
-        }
-        .await;
-        self.finish(r).await
-    }
-
-    /// Performs a request whose response is `SSH_FXP_HANDLE`.
-    async fn request_handle(
-        &mut self,
-        id: ReqId,
-        packet: SftpPacket<'_>,
         kind: HandleKind,
     ) -> SftpResult<RemoteHandle> {
-        let r = async {
-            self.send(&packet).await?;
-            match self.recv(id).await? {
-                SftpNum::SSH_FXP_HANDLE => {
-                    let mut h = RemoteHandle::empty(kind);
-                    let l = take_string(
-                        &mut self.reader,
-                        &mut self.pkt_remaining,
-                        &mut h.handle,
-                    )
-                    .await?
-                    .len();
-                    h.len = l as u16;
-                    Ok(h)
-                }
-                SftpNum::SSH_FXP_STATUS => {
-                    // A SSH_FX_OK status isn't a valid reply to an open
-                    Self::status_result(self.recv_status_body().await?)?;
-                    Err(SftpError::BadResponse)
-                }
-                ty => {
-                    debug!("Unexpected {:?} response to an open request", ty);
-                    Err(SftpError::BadResponse)
-                }
+        self.send_out(&[]).await?;
+        let (rid, r) = self.next_reply(&mut []).await?;
+        check_id(rid, id)?;
+        match r {
+            Reply::Handle(mut h) => {
+                h.kind = kind;
+                Ok(h)
+            }
+            // A SSH_FX_OK status isn't a valid reply to an open
+            Reply::Status(code) => {
+                status_result(code)?;
+                Err(SftpError::BadResponse)
+            }
+            r => {
+                debug!("Unexpected {:?} response to an open request", r);
+                Err(SftpError::BadResponse)
             }
         }
-        .await;
-        self.finish(r).await
     }
 
-    /// Performs a request whose response is `SSH_FXP_ATTRS`.
-    async fn request_attrs(
-        &mut self,
-        id: ReqId,
-        packet: SftpPacket<'_>,
-    ) -> SftpResult<Attrs> {
-        let r = async {
-            self.send(&packet).await?;
-            match self.recv(id).await? {
-                SftpNum::SSH_FXP_ATTRS => {
-                    take_attrs(&mut self.reader, &mut self.pkt_remaining).await
-                }
-                SftpNum::SSH_FXP_STATUS => {
-                    Self::status_result(self.recv_status_body().await?)?;
-                    Err(SftpError::BadResponse)
-                }
-                ty => {
-                    debug!("Unexpected {:?} response to a stat request", ty);
-                    Err(SftpError::BadResponse)
-                }
+    /// Sends the queued request and reads its `SSH_FXP_ATTRS`.
+    async fn do_attrs(&mut self, id: ReqId) -> SftpResult<Attrs> {
+        self.send_out(&[]).await?;
+        let (rid, r) = self.next_reply(&mut []).await?;
+        check_id(rid, id)?;
+        match r {
+            Reply::Attrs(a) => Ok(a),
+            Reply::Status(code) => {
+                status_result(code)?;
+                Err(SftpError::BadResponse)
+            }
+            r => {
+                debug!("Unexpected {:?} response to a stat request", r);
+                Err(SftpError::BadResponse)
             }
         }
-        .await;
-        self.finish(r).await
     }
 
-    /// Performs a request whose response is a single entry `SSH_FXP_NAME`.
-    ///
-    /// The name is written to `out`, the rest of the entry is discarded.
-    async fn request_name<'b>(
-        &mut self,
-        id: ReqId,
-        packet: SftpPacket<'_>,
-        out: &'b mut [u8],
-    ) -> SftpResult<&'b [u8]> {
-        // The length is returned rather than a slice of `out`, so that
-        // `out` can be borrowed again after `finish()`.
-        let r = async {
-            self.send(&packet).await?;
-            match self.recv(id).await? {
-                SftpNum::SSH_FXP_NAME => {
-                    let count =
-                        take_u32(&mut self.reader, &mut self.pkt_remaining).await?;
-                    if count < 1 {
-                        debug!("Empty name response");
-                        return Err(SftpError::BadResponse);
-                    }
-                    let n =
-                        take_string(&mut self.reader, &mut self.pkt_remaining, out)
-                            .await?
-                            .len();
-                    Ok(n)
-                }
-                SftpNum::SSH_FXP_STATUS => {
-                    Self::status_result(self.recv_status_body().await?)?;
-                    Err(SftpError::BadResponse)
-                }
-                ty => {
-                    debug!("Unexpected {:?} response to a name request", ty);
-                    Err(SftpError::BadResponse)
-                }
+    /// Sends the queued request and reads the single name it answers
+    /// with into `out`.
+    async fn do_name(&mut self, id: ReqId, out: &mut [u8]) -> SftpResult<usize> {
+        self.send_out(&[]).await?;
+        let (rid, r) = self.next_reply(&mut []).await?;
+        check_id(rid, id)?;
+        match r {
+            Reply::NameStart(count) if count >= 1 => (),
+            Reply::NameStart(_) => {
+                debug!("Empty name response");
+                // The NameEnd is left for the next drain
+                return Err(SftpError::BadResponse);
+            }
+            Reply::Status(code) => {
+                status_result(code)?;
+                return Err(SftpError::BadResponse);
+            }
+            r => {
+                debug!("Unexpected {:?} response to a name request", r);
+                return Err(SftpError::BadResponse);
             }
         }
-        .await;
-        let n = self.finish(r).await?;
-        Ok(&out[..n])
+
+        let want = out.len();
+        let (rid, r) = self.next_reply(out).await?;
+        check_id(rid, id)?;
+        let n = match r {
+            Reply::Name(n) => n,
+            r => {
+                debug!("Unexpected {:?} in a name response", r);
+                return Err(SftpError::BadResponse);
+            }
+        };
+        // Leave the reply finished either way, so the next request
+        // doesn't have to drain it.
+        self.end_name(id).await?;
+        if n > want {
+            debug!("Name of {} bytes doesn't fit {}", n, want);
+            return Err(SftpError::NoRoom);
+        }
+        Ok(n)
     }
 
-    // ========================== SFTP requests ============================
+    /// Consumes the rest of a name reply.
+    async fn end_name(&mut self, id: ReqId) -> SftpResult<()> {
+        loop {
+            let (rid, r) = self.next_reply(&mut []).await?;
+            check_id(rid, id)?;
+            if matches!(r, Reply::NameEnd) {
+                return Ok(());
+            }
+        }
+    }
+
+    // =========================== SFTP requests ============================
 
     /// Performs the SFTP version handshake.
     ///
     /// Must be called once, before any other request. Returns the
-    /// version agreed with the server, always [`SFTP_VERSION`] since
+    /// version agreed with the server, always
+    /// [`SFTP_VERSION`](crate::protocol::constants::SFTP_VERSION) since
     /// that is the only version implemented.
     pub async fn init(&mut self) -> SftpResult<u32> {
-        if self.version.is_some() {
-            return Err(SftpError::AlreadyInitialized);
-        }
         if self.poisoned {
             return Err(SftpError::Interrupted);
         }
-        // SSH_FXP_INIT carries a version rather than a request id, so it
-        // doesn't use begin()/send()/recv().
-        self.poisoned = true;
+        self.runner.init()?;
+        self.send_out(&[]).await?;
 
-        let r = async {
-            let init = SftpPacket::Init(InitVersionClient { version: SFTP_VERSION });
-            {
-                let mut sink = SftpSink::new(&mut self.buf);
-                init.enc(&mut sink)?;
-                let out = sink.used_slice();
-                self.writer
-                    .write_all(out)
-                    .await
-                    .map_err(SftpError::from_embedded_io)?;
+        let (_, r) = self.next_reply(&mut []).await?;
+        match r {
+            Reply::Version(version) => {
+                debug!(
+                    "SFTP version {}, extensions {:?}",
+                    version,
+                    self.runner.extensions()
+                );
+                Ok(version)
             }
-            self.writer.flush().await.map_err(SftpError::from_embedded_io)?;
-
-            let mut lb = [0u8; 4];
-            read_exact(&mut self.reader, &mut lb).await?;
-            let len = u32::from_be_bytes(lb) as usize;
-            if !(5..=SFTP_MAXIMUM_PACKET_LEN).contains(&len) {
-                debug!("Bad version response length {}", len);
-                return Err(SftpError::MalformedPacket);
+            r => {
+                debug!("Expected SSH_FXP_VERSION, got {:?}", r);
+                Err(SftpError::BadResponse)
             }
-            self.pkt_remaining = len;
-
-            let ty = SftpNum::from(
-                take_u8(&mut self.reader, &mut self.pkt_remaining).await?,
-            );
-            if ty != SftpNum::SSH_FXP_VERSION {
-                debug!("Expected SSH_FXP_VERSION, got {:?}", ty);
-                return Err(SftpError::BadResponse);
-            }
-
-            let version =
-                take_u32(&mut self.reader, &mut self.pkt_remaining).await?;
-            if version != SFTP_VERSION {
-                // The server replies with the lowest of the two versions,
-                // and Sunset only implements version 3.
-                warn!("Server SFTP version {} is not supported", version);
-                return Err(SftpError::NotSupported);
-            }
-
-            // Extension pairs fill the rest of the packet.
-            while self.pkt_remaining > 0 {
-                let name = try_take_string(
-                    &mut self.reader,
-                    &mut self.pkt_remaining,
-                    &mut self.buf,
-                )
-                .await?;
-                if let Some(name) = name {
-                    self.extensions.set_by_name(name);
-                }
-                // extension data
-                skip_string(&mut self.reader, &mut self.pkt_remaining).await?;
-            }
-
-            Ok(version)
         }
-        .await;
-
-        let version = self.finish(r).await?;
-        self.version = Some(version);
-        debug!("SFTP version {}, extensions {:?}", version, self.extensions);
-        Ok(version)
     }
 
     /// Opens a file.
@@ -622,16 +549,9 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         flags: u32,
         attrs: &Attrs,
     ) -> SftpResult<RemoteHandle> {
-        let id = self.begin().await?;
-        let packet = SftpPacket::Open(
-            id,
-            Open {
-                filename: Filename::from(path),
-                pflags: PFlags::from(flags),
-                attrs: *attrs,
-            },
-        );
-        self.request_handle(id, packet, HandleKind::File).await
+        self.begin().await?;
+        let id = self.runner.open(path, flags, attrs)?;
+        self.do_handle(id, HandleKind::File).await
     }
 
     /// Opens an existing file for reading.
@@ -653,20 +573,16 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
     ///
     /// The returned handle must be given to [`close()`](Self::close).
     pub async fn opendir(&mut self, path: &str) -> SftpResult<RemoteHandle> {
-        let id = self.begin().await?;
-        let packet =
-            SftpPacket::OpenDir(id, OpenDir { dirname: Filename::from(path) });
-        self.request_handle(id, packet, HandleKind::Dir).await
+        self.begin().await?;
+        let id = self.runner.opendir(path)?;
+        self.do_handle(id, HandleKind::Dir).await
     }
 
     /// Closes a file or directory handle.
     pub async fn close(&mut self, handle: &RemoteHandle) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::Close(id, Close { handle: handle.opaque() }),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.close(handle.as_bytes())?;
+        self.do_status(id).await
     }
 
     /// Reads from an open file.
@@ -689,9 +605,8 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.start().await?;
-        let r = self.read_chunks(handle, offset, buf).await;
-        self.finish(r).await
+        self.begin().await?;
+        self.read_chunks(handle, offset, buf).await
     }
 
     /// The body of [`read()`](Self::read), with requests pipelined.
@@ -724,16 +639,12 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
             {
                 let pos = next * chunk;
                 let want = (buf.len() - pos).min(chunk);
-                let id = self.next_id();
-                let packet = SftpPacket::Read(
-                    id,
-                    crate::proto::Read {
-                        handle: handle.opaque(),
-                        offset: offset + pos as u64,
-                        len: want as u32,
-                    },
-                );
-                self.send(&packet).await?;
+                let id = self.runner.read(
+                    handle.as_bytes(),
+                    offset + pos as u64,
+                    want as u32,
+                )?;
+                self.send_out(&[]).await?;
 
                 // OK unwrap, n_inflight counts the used slots
                 let slot = inflight.iter_mut().find(|s| s.is_none()).unwrap();
@@ -746,7 +657,7 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
                 break;
             }
 
-            let (ty, id) = self.recv_any().await?;
+            let (id, r) = self.next_reply(&mut []).await?;
             let Some(slot) =
                 inflight.iter_mut().find(|s| s.is_some_and(|(i, _)| i == id))
             else {
@@ -760,43 +671,31 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
             let pos = idx * chunk;
             let want = (buf.len() - pos).min(chunk);
 
-            match ty {
-                SftpNum::SSH_FXP_DATA => {
-                    let len = take_u32(&mut self.reader, &mut self.pkt_remaining)
-                        .await? as usize;
-                    if len > want {
-                        // Would overflow the caller's buffer
-                        warn!(
-                            "Server returned {} bytes for a {} byte read",
-                            len, want
-                        );
-                        failed = failed.or(Some(SftpError::BadResponse));
-                    } else {
-                        take(
-                            &mut self.reader,
-                            &mut self.pkt_remaining,
-                            &mut buf[pos..pos + len],
-                        )
-                        .await?;
-                        if len < want {
-                            note_short(&mut short, idx, len);
-                        }
+            match r {
+                Reply::Data(len) if len > want => {
+                    // Would overflow the caller's buffer. Take it off
+                    // the stream anyway, other chunks are still coming.
+                    warn!("Server returned {} bytes for a {} byte read", len, want);
+                    self.discard_data().await?;
+                    failed = failed.or(Some(SftpError::BadResponse));
+                }
+                Reply::Data(len) => {
+                    self.take_data(&mut buf[pos..pos + len]).await?;
+                    if len < want {
+                        note_short(&mut short, idx, len);
                     }
                 }
-                SftpNum::SSH_FXP_STATUS => match self.recv_status_body().await? {
-                    StatusCode::SSH_FX_EOF => note_short(&mut short, idx, 0),
-                    code => {
-                        failed = failed.or(Some(SftpError::FileServerError(code)))
-                    }
-                },
-                ty => {
-                    debug!("Unexpected {:?} response to a read request", ty);
+                Reply::Status(StatusCode::SSH_FX_EOF) => {
+                    note_short(&mut short, idx, 0)
+                }
+                Reply::Status(code) => {
+                    failed = failed.or(Some(SftpError::FileServerError(code)))
+                }
+                r => {
+                    debug!("Unexpected {:?} response to a read request", r);
                     failed = failed.or(Some(SftpError::BadResponse));
                 }
             }
-
-            // Leave the stream at a packet boundary for the next response
-            drain(&mut self.reader, &mut self.pkt_remaining).await?;
         }
 
         if let Some(e) = failed {
@@ -812,8 +711,12 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
     /// Writes to an open file.
     ///
     /// All of `data` is written. Data longer than [`MAX_WRITE_LEN`] is
-    /// split into several requests, pipelined so that the transfer
-    /// isn't limited to one chunk per round trip.
+    /// split into several requests.
+    ///
+    /// Unlike [`read()`](Self::read) these aren't pipelined: a write
+    /// sent ahead has to be held somewhere until the peer reads it,
+    /// and a peer that is busy replying can stop reading, which would
+    /// deadlock both sides.
     pub async fn write(
         &mut self,
         handle: &RemoteHandle,
@@ -821,78 +724,20 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         data: &[u8],
     ) -> SftpResult<()> {
         handle.check(HandleKind::File)?;
-        self.start().await?;
-        let r = self.write_chunks(handle, offset, data).await;
-        self.finish(r).await
-    }
+        self.begin().await?;
 
-    /// The body of [`write()`](Self::write), one request at a time.
-    async fn write_chunks(
-        &mut self,
-        handle: &RemoteHandle,
-        offset: u64,
-        data: &[u8],
-    ) -> SftpResult<()> {
         let chunk = MAX_WRITE_LEN as usize;
         // A zero length write is still a request
         let chunks = data.len().div_ceil(chunk).max(1);
-
         for n in 0..chunks {
             let pos = n * chunk;
             let len = (data.len() - pos).min(chunk);
-            let id = self.next_id();
-            self.send_write(handle, id, offset + pos as u64, &data[pos..pos + len])
-                .await?;
-
-            let r = match self.recv(id).await? {
-                SftpNum::SSH_FXP_STATUS => {
-                    Self::status_result(self.recv_status_body().await?)
-                }
-                ty => {
-                    debug!("Unexpected {:?} response to a write request", ty);
-                    Err(SftpError::BadResponse)
-                }
-            };
-            // Leave the stream at a packet boundary either way
-            drain(&mut self.reader, &mut self.pkt_remaining).await?;
-            r?;
+            let id =
+                self.runner.write(handle.as_bytes(), offset + pos as u64, len)?;
+            self.send_out(&data[pos..pos + len]).await?;
+            self.expect_status(id).await?;
         }
         Ok(())
-    }
-
-    /// Sends one `SSH_FXP_WRITE`.
-    ///
-    /// Encoded by hand since the data is streamed rather than being
-    /// copied through the client's buffer.
-    async fn send_write(
-        &mut self,
-        handle: &RemoteHandle,
-        id: ReqId,
-        offset: u64,
-        data: &[u8],
-    ) -> SftpResult<()> {
-        let body_len = 1 // packet type
-            + 4 // request id
-            + 4 + handle.as_bytes().len() // handle string
-            + 8 // offset
-            + 4 + data.len(); // data string
-        let body_len: u32 = body_len.try_into().map_err(|_| SftpError::NoRoom)?;
-
-        {
-            let mut sink = SftpSink::new(&mut self.buf);
-            // The length field is encoded explicitly here. send() uses
-            // payload_slice(), skipping the sink's own length.
-            body_len.enc(&mut sink)?;
-            u8::from(SftpNum::SSH_FXP_WRITE).enc(&mut sink)?;
-            id.enc(&mut sink)?;
-            handle.opaque().enc(&mut sink)?;
-            offset.enc(&mut sink)?;
-            (data.len() as u32).enc(&mut sink)?;
-            sink.send(&mut self.writer).await?;
-        }
-        self.writer.write_all(data).await.map_err(SftpError::from_embedded_io)?;
-        self.outstanding += 1;
-        self.writer.flush().await.map_err(SftpError::from_embedded_io)
     }
 
     /// Lists part of an open directory.
@@ -928,75 +773,52 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         handle: &RemoteHandle,
     ) -> SftpResult<Option<DirIter<'_, R, W, BUF>>> {
         handle.check(HandleKind::Dir)?;
-        let id = self.begin().await?;
-        let packet = SftpPacket::ReadDir(id, ReadDir { handle: handle.opaque() });
+        self.begin().await?;
+        let id = self.runner.readdir(handle.as_bytes())?;
+        self.send_out(&[]).await?;
 
-        let r = async {
-            self.send(&packet).await?;
-            match self.recv(id).await? {
-                SftpNum::SSH_FXP_NAME => Ok(Some(
-                    take_u32(&mut self.reader, &mut self.pkt_remaining).await?,
-                )),
-                SftpNum::SSH_FXP_STATUS => match self.recv_status_body().await? {
-                    StatusCode::SSH_FX_EOF => Ok(None),
-                    code => Err(SftpError::FileServerError(code)),
-                },
-                ty => {
-                    debug!("Unexpected {:?} response to a readdir request", ty);
-                    Err(SftpError::BadResponse)
-                }
-            }
-        }
-        .await;
-
+        let (rid, r) = self.next_reply(&mut []).await?;
+        check_id(rid, id)?;
         match r {
-            Ok(Some(count)) => {
-                // The entries are read by the iterator. The stream
-                // position is known, so the client isn't left poisoned.
-                self.poisoned = false;
-                Ok(Some(DirIter::new(self, count)))
+            // The entries are read by the iterator
+            Reply::NameStart(count) => Ok(Some(DirIter::new(self, id, count))),
+            Reply::Status(StatusCode::SSH_FX_EOF) => Ok(None),
+            Reply::Status(code) => Err(SftpError::FileServerError(code)),
+            r => {
+                debug!("Unexpected {:?} response to a readdir request", r);
+                Err(SftpError::BadResponse)
             }
-            Ok(None) => self.finish(Ok(None)).await,
-            Err(e) => self.finish(Err(e)).await,
         }
     }
 
     /// Returns the attributes of a path, following symbolic links.
     pub async fn stat(&mut self, path: &str) -> SftpResult<Attrs> {
-        let id = self.begin().await?;
-        let packet =
-            SftpPacket::Stat(id, Stat { file_path: TextString(path.as_bytes()) });
-        self.request_attrs(id, packet).await
+        self.begin().await?;
+        let id = self.runner.stat(path)?;
+        self.do_attrs(id).await
     }
 
     /// Returns the attributes of a path, without following symbolic links.
     pub async fn lstat(&mut self, path: &str) -> SftpResult<Attrs> {
-        let id = self.begin().await?;
-        let packet =
-            SftpPacket::LStat(id, LStat { file_path: TextString(path.as_bytes()) });
-        self.request_attrs(id, packet).await
+        self.begin().await?;
+        let id = self.runner.lstat(path)?;
+        self.do_attrs(id).await
     }
 
     /// Returns the attributes of an open file.
     pub async fn fstat(&mut self, handle: &RemoteHandle) -> SftpResult<Attrs> {
-        let id = self.begin().await?;
-        let packet = SftpPacket::FStat(id, FStat { handle: handle.opaque() });
-        self.request_attrs(id, packet).await
+        self.begin().await?;
+        let id = self.runner.fstat(handle.as_bytes())?;
+        self.do_attrs(id).await
     }
 
     /// Modifies the attributes of a path.
     ///
     /// Only the attributes set in `attrs` are modified.
     pub async fn setstat(&mut self, path: &str, attrs: &Attrs) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::SetStat(
-                id,
-                SetStat { file_path: TextString(path.as_bytes()), attrs: *attrs },
-            ),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.setstat(path, attrs)?;
+        self.do_status(id).await
     }
 
     /// Modifies the attributes of an open file.
@@ -1007,51 +829,30 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         handle: &RemoteHandle,
         attrs: &Attrs,
     ) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::FSetStat(
-                id,
-                FSetStat { handle: handle.opaque(), attrs: *attrs },
-            ),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.fsetstat(handle.as_bytes(), attrs)?;
+        self.do_status(id).await
     }
 
     /// Removes a file. This will not remove directories.
     pub async fn remove(&mut self, path: &str) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::Remove(
-                id,
-                Remove { file_path: TextString(path.as_bytes()) },
-            ),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.remove(path)?;
+        self.do_status(id).await
     }
 
     /// Creates a directory.
     pub async fn mkdir(&mut self, path: &str, attrs: &Attrs) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::MkDir(
-                id,
-                MkDir { dir_path: TextString(path.as_bytes()), attrs: *attrs },
-            ),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.mkdir(path, attrs)?;
+        self.do_status(id).await
     }
 
     /// Removes an empty directory.
     pub async fn rmdir(&mut self, path: &str) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::RmDir(id, RmDir { dir_path: TextString(path.as_bytes()) }),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.rmdir(path)?;
+        self.do_status(id).await
     }
 
     /// Renames a file or directory.
@@ -1060,18 +861,9 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
     /// [`posix_rename()`](Self::posix_rename) replaces the destination
     /// instead, where the server supports it.
     pub async fn rename(&mut self, old: &str, new: &str) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::Rename(
-                id,
-                Rename {
-                    old_path: TextString(old.as_bytes()),
-                    new_path: TextString(new.as_bytes()),
-                },
-            ),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.rename(old, new)?;
+        self.do_status(id).await
     }
 
     /// Creates a symbolic link at `link_path` pointing to `target_path`.
@@ -1080,18 +872,9 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         target_path: &str,
         link_path: &str,
     ) -> SftpResult<()> {
-        let id = self.begin().await?;
-        self.request_status(
-            id,
-            SftpPacket::Symlink(
-                id,
-                Symlink {
-                    target_path: TextString(target_path.as_bytes()),
-                    link_path: TextString(link_path.as_bytes()),
-                },
-            ),
-        )
-        .await
+        self.begin().await?;
+        let id = self.runner.symlink(target_path, link_path)?;
+        self.do_status(id).await
     }
 
     /// Canonicalises a path, returning the server's absolute form.
@@ -1103,10 +886,12 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         path: &str,
         out: &'b mut [u8],
     ) -> SftpResult<&'b [u8]> {
-        let id = self.begin().await?;
-        let packet =
-            SftpPacket::PathInfo(id, PathInfo { path: TextString(path.as_bytes()) });
-        self.request_name(id, packet, out).await
+        self.begin().await?;
+        let id = self.runner.realpath(path)?;
+        // The length is returned rather than a slice of `out`, so that
+        // `out` can be borrowed again here.
+        let n = self.do_name(id, out).await?;
+        Ok(&out[..n])
     }
 
     /// Returns the target of a symbolic link.
@@ -1118,15 +903,13 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         path: &str,
         out: &'b mut [u8],
     ) -> SftpResult<&'b [u8]> {
-        let id = self.begin().await?;
-        let packet = SftpPacket::ReadLink(
-            id,
-            ReadLink { file_path: TextString(path.as_bytes()) },
-        );
-        self.request_name(id, packet, out).await
+        self.begin().await?;
+        let id = self.runner.readlink(path)?;
+        let n = self.do_name(id, out).await?;
+        Ok(&out[..n])
     }
 
-    // ======================= Extended requests ===========================
+    // ======================== Extended requests ===========================
 
     /// Sends an extended request with `args` as its payload.
     async fn request_extended(
@@ -1134,34 +917,9 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
         name: &str,
         args: &dyn SSHEncode,
     ) -> SftpResult<()> {
-        let id = self.begin().await?;
-        let r = async {
-            {
-                let mut sink = SftpSink::new(&mut self.buf);
-                SSH_FXP_EXTENDED.enc(&mut sink)?;
-                id.enc(&mut sink)?;
-                TextString(name.as_bytes()).enc(&mut sink)?;
-                args.enc(&mut sink)?;
-                let out = sink.used_slice();
-                self.writer
-                    .write_all(out)
-                    .await
-                    .map_err(SftpError::from_embedded_io)?;
-            }
-            self.writer.flush().await.map_err(SftpError::from_embedded_io)?;
-
-            match self.recv(id).await? {
-                SftpNum::SSH_FXP_STATUS => {
-                    Self::status_result(self.recv_status_body().await?)
-                }
-                ty => {
-                    debug!("Unexpected {:?} response to {}", ty, name);
-                    Err(SftpError::BadResponse)
-                }
-            }
-        }
-        .await;
-        self.finish(r).await
+        self.begin().await?;
+        let id = self.runner.extended(name, args)?;
+        self.do_status(id).await
     }
 
     /// Renames a file, replacing `new` if it exists.
@@ -1169,7 +927,7 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
     /// Uses the `posix-rename@openssh.com` extension, only available
     /// when [`extensions()`](Self::extensions) reports `posix_rename`.
     pub async fn posix_rename(&mut self, old: &str, new: &str) -> SftpResult<()> {
-        if !self.extensions.posix_rename {
+        if !self.runner.extensions().posix_rename {
             return Err(SftpError::NotSupported);
         }
         // The extension payload is two paths, the same as a rename.
@@ -1188,7 +946,7 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
     /// Uses the `hardlink@openssh.com` extension, only available when
     /// [`extensions()`](Self::extensions) reports `hardlink`.
     pub async fn hardlink(&mut self, old: &str, new: &str) -> SftpResult<()> {
-        if !self.extensions.hardlink {
+        if !self.runner.extensions().hardlink {
             return Err(SftpError::NotSupported);
         }
         self.request_extended(
@@ -1206,24 +964,16 @@ impl<R: Read, W: Write, const BUF: usize> SftpClient<R, W, BUF> {
     /// Uses the `fsync@openssh.com` extension, only available when
     /// [`extensions()`](Self::extensions) reports `fsync`.
     pub async fn fsync(&mut self, handle: &RemoteHandle) -> SftpResult<()> {
-        if !self.extensions.fsync {
+        if !self.runner.extensions().fsync {
             return Err(SftpError::NotSupported);
         }
         handle.check(HandleKind::File)?;
-        self.request_extended("fsync@openssh.com", &handle.opaque()).await
-    }
-
-    // Used by `DirIter`, which reads the response body itself.
-
-    pub(crate) fn reader_buf(&mut self) -> (&mut R, &mut usize, &mut [u8]) {
-        (&mut self.reader, &mut self.pkt_remaining, &mut self.buf)
-    }
-
-    pub(crate) fn set_poisoned(&mut self, poisoned: bool) {
-        self.poisoned = poisoned;
-    }
-
-    pub(crate) async fn drain_packet(&mut self) -> SftpResult<()> {
-        drain(&mut self.reader, &mut self.pkt_remaining).await
+        self.request_extended(
+            "fsync@openssh.com",
+            &crate::proto::OpaqueHandle(sunset::sshwire::BinString(
+                handle.as_bytes(),
+            )),
+        )
+        .await
     }
 }

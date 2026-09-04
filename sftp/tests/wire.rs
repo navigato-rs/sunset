@@ -430,6 +430,34 @@ fn oversized_data_response_is_refused() {
     run_test(client.close(&h)).expect("close");
 }
 
+/// An oversized chunk has to come off the stream straight away, since
+/// the replies to the other pipelined chunks are queued behind it.
+#[test]
+fn an_oversized_chunk_doesnt_strand_the_pipeline() {
+    let (s, mut client) = Scripted::new(&[]);
+    let mut handle_body = vec![102u8];
+    handle_body.extend_from_slice(&1u32.to_be_bytes());
+    handle_body.extend_from_slice(&string(b"abcd"));
+    s.to_client.push(&packet(handle_body));
+    let h = run_test(client.open_read("/f")).expect("open");
+
+    // Two chunks are requested. The first comes back far longer than
+    // asked for, the second is a normal short read.
+    let chunk = client::MAX_READ_LEN as usize;
+    s.to_client.push(&data_packet(2, &vec![7u8; chunk + 100]));
+    s.to_client.push(&data_packet(3, &[9u8; 16]));
+
+    let mut buf = vec![0u8; chunk + 32];
+    assert!(matches!(
+        run_test(client.read(&h, 0, &mut buf)),
+        Err(SftpError::BadResponse)
+    ));
+    // Both replies were consumed, so the session continues
+    s.to_client.push(&status_packet(4, 0));
+    run_test(client.close(&h)).expect("close");
+    assert!(s.to_client.take().is_empty(), "nothing left unread");
+}
+
 #[test]
 fn attrs_response_with_extended_attributes() {
     let (s, mut client) = Scripted::new(&[]);
@@ -458,8 +486,10 @@ fn attrs_response_with_extended_attributes() {
     run_test(client.remove("/f")).expect("remove");
 }
 
+/// A dropped future leaves a reply on the stream, which the next
+/// request takes off before its own.
 #[test]
-fn interrupted_request_poisons_the_client() {
+fn an_abandoned_request_recovers() {
     let (s, mut client) = Scripted::new(&[]);
 
     // Start a request but never let it see a response.
@@ -467,13 +497,39 @@ fn interrupted_request_poisons_the_client() {
         let mut fut = pin!(client.remove("/a"));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
-        // Future dropped here, mid request.
+        // Future dropped here, waiting for a reply.
     }
     assert!(!s.from_client.take().is_empty(), "the request was sent");
 
-    // Even with a response now available, the client refuses to
-    // continue rather than pairing it with the wrong request.
+    // The abandoned reply, then the reply to the request that follows.
     s.to_client.push(&status_packet(1, 0));
+    s.to_client.push(&status_packet(2, 0));
+    run_test(client.remove("/b")).expect("remove");
+    assert!(s.to_client.take().is_empty(), "both replies were consumed");
+}
+
+/// A request that was only half sent leaves the peer mid-packet, which
+/// nothing can recover from.
+#[test]
+fn a_half_sent_request_poisons_the_client() {
+    let to_client = Pipe::new();
+    // Room for the handshake, and then not much
+    let from_client = Pipe::bounded(9 + 4);
+    to_client.push(&version_packet(3, &[]));
+
+    let mut client: Client =
+        SftpClient::new(to_client.reader(), from_client.writer());
+    run_test(client.init()).expect("init");
+    assert_eq!(from_client.take(), packet(vec![1, 0, 0, 0, 3]));
+
+    {
+        let mut fut = pin!(client.remove("/a/long/enough/to/not/fit"));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        // Future dropped here, part way through writing.
+    }
+    assert_eq!(from_client.take().len(), 13, "a partial request went out");
+
     assert!(matches!(run_test(client.remove("/b")), Err(SftpError::Interrupted)));
 }
 
