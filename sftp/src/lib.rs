@@ -5,63 +5,75 @@
 //! **Work in Progress**: please see the roadmap and use this crate carefully.
 //!
 //! Both sides are `no_std` and allocation free. While designed for use
-//! with Sunset SSH, they should be usable with any transport that
-//! implements the `embedded_io_async` `Read`/`Write` traits.
+//! with Sunset SSH, they should be usable with any transport.
+//!
+//! The client's protocol core does no IO of its own, so it needs
+//! nothing of the transport at all; the layers that do read and write
+//! use the `embedded_io_async` `Read`/`Write` traits, and are behind
+//! the default `async` feature. With `default-features = false` this
+//! crate has no async dependencies whatsoever.
 //!
 //! # Server
 //!
 //! [`SftpServerHandler`] dispatches SFTP packets to a struct implementing
 //! the [`SftpServer`](server::SftpServer) trait, which the application
-//! provides to describe its filesystem.
+//! provides to describe its filesystem. The server side is async
+//! throughout, so it needs the `async` feature.
 //!
 //! See example usage in the `../demo/sftp/std` directory.
 //!
 //! # Client
 //!
-//! [`SftpClient`](client::SftpClient) makes requests over a SSH channel
-//! that has had the `sftp` subsystem started on it. With `sunset-async`
-//! that is a client session channel opened with
-//! `SSHClient::open_session_nopty()`, with
-//! `SessionCommand::Subsystem("sftp")` requested on it.
+//! [`SftpRunner`](client::SftpRunner) is the protocol on its own and
+//! performs no IO: requests go in, bytes come out, bytes go in,
+//! [events](client::SftpEvent) come out. That is the same shape as
+//! [`sunset::Runner`], and for the same reasons — the caller decides
+//! how the bytes move, so it works from a blocking loop, an interrupt
+//! handler, or a test that feeds it byte by byte.
 //!
 //! ```
-//! use sunset_sftp::client::SftpClient;
-//! use sunset_sftp::embedded_io_async::{Read, Write};
+//! use sunset_sftp::client::{SftpEvent, SftpRunner};
 //! use sunset_sftp::error::SftpResult;
 //!
-//! // chan_in and chan_out are the two halves of the SFTP channel.
-//! async fn upload(
-//!     chan_in: impl Read,
-//!     chan_out: impl Write,
-//!     data: &[u8],
-//! ) -> SftpResult<()> {
-//!     let mut client = SftpClient::new_default_buffer(chan_in, chan_out);
-//!     client.init().await?;
-//!
-//!     let f = client.create("/tmp/hello").await?;
-//!     for (i, chunk) in data.chunks(4096).enumerate() {
-//!         client.write(&f, (i * 4096) as u64, chunk).await?;
+//! /// Asks for a path's attributes, moving the bytes with the two
+//! /// closures. Neither the runner nor this function does any IO.
+//! fn size<const B: usize>(
+//!     sftp: &mut SftpRunner<B, B>,
+//!     path: &str,
+//!     mut send: impl FnMut(&[u8]),
+//!     mut recv: impl FnMut(&mut [u8]) -> usize,
+//! ) -> SftpResult<Option<u64>> {
+//!     sftp.stat(path)?;
+//!     while !sftp.output_buf().is_empty() {
+//!         send(sftp.output_buf());
+//!         let sent = sftp.output_buf().len();
+//!         sftp.consume_output(sent);
 //!     }
-//!     client.close(&f).await
+//!
+//!     while !sftp.has_event() {
+//!         let got = recv(sftp.input_buf());
+//!         sftp.input_done(got)?;
+//!     }
+//!     Ok(match sftp.event() {
+//!         Some(SftpEvent::Attrs { attrs, .. }) => attrs.size,
+//!         _ => None,
+//!     })
 //! }
 //! ```
+//!
+//! [`SftpClient`](client::SftpClient) is the `embedded_io_async` layer
+//! over that, for a SSH channel that has had the `sftp` subsystem
+//! started on it. With `sunset-async` that is a client session channel
+//! opened with `SSHClient::open_session_nopty()`, with
+//! `SessionCommand::Subsystem("sftp")` requested on it. It needs the
+//! `async` feature, which is on by default; without it this crate has
+//! no async dependencies at all.
 //!
 //! File contents and directory listings are streamed, so transfers
 //! aren't limited by the client's buffer size. Reads and writes larger
 //! than one packet are split into several requests, and reads are
 //! pipelined so that a download isn't limited to one chunk per round
 //! trip. Writes wait for each reply, see [`SftpClient::write`](client::SftpClient::write).
-//!
-//! ## Without async
-//!
-//! [`SftpClient`](client::SftpClient) is a thin layer of IO over
-//! [`SftpRunner`](client::SftpRunner), which is the protocol on its
-//! own and performs no IO at all: requests go in, bytes come out, bytes
-//! go in, [events](client::SftpEvent) come out. That is the same shape
-//! as [`sunset::Runner`], and for the same reasons — the caller decides
-//! how the bytes move, so it works from a blocking loop, an interrupt
-//! handler, or a test that feeds it byte by byte. File data is never
-//! copied through it.
 //!
 //! # Roadmap
 //!
@@ -103,6 +115,13 @@
 //! - [x] Pipelining reads, to avoid a round trip per block downloaded
 //! - [x] A sans-io core, [`SftpRunner`](client::SftpRunner), so the
 //!   protocol isn't tied to `embedded_io_async`
+//!
+//! ## Desirable
+//!
+//! - The same sans-io treatment for the server. The
+//!   [`SftpServer`](server::SftpServer) trait is async by design, since
+//!   a filesystem operation may well have to wait, so this would be a
+//!   second way of writing a server rather than a rework of that one.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -114,15 +133,20 @@
 mod proto;
 mod sftpclient;
 mod sftperror;
-mod sftphandler;
-mod sftpserver;
 mod sftpsink;
+
+#[cfg(feature = "async")]
+mod sftphandler;
+#[cfg(feature = "async")]
+mod sftpserver;
+#[cfg(feature = "async")]
 mod sftpsource;
 
 // Main calling point for the library provided that the user implements
 // a [`server::SftpServer`].
 //
 // Please see basic usage at `../demo/sftp/std`
+#[cfg(feature = "async")]
 pub use sftphandler::SftpServerHandler;
 
 /// Structures and types used to add the details for the target system
@@ -130,6 +154,7 @@ pub use sftphandler::SftpServerHandler;
 /// Related to the implementation of the [`server::SftpServer`], which
 /// is meant to be instantiated by the user and passed to [`SftpServerHandler`]
 /// and has the task of executing client requests in the underlying system
+#[cfg(feature = "async")]
 pub mod server {
 
     pub use crate::sftpserver::{
@@ -146,7 +171,7 @@ pub mod server {
     pub mod helpers {
         pub use crate::sftpserver::helpers::*;
     }
-    pub use crate::sftpsink::SftpSink;
+    pub use crate::protocol::SftpSink;
     pub use sunset::sshwire::SSHEncode;
 
     pub use crate::proto::MAX_REQUEST_LEN;
@@ -160,10 +185,13 @@ pub mod client {
     pub use crate::proto::Extensions;
     pub use crate::sftpclient::{
         DEFAULT_CLIENT_BUF, MAX_DIR_ENTRY_LEN, MAX_READ_LEN, MAX_WRITE_LEN,
-        PIPELINE_DEPTH, RemoteHandle, SftpClient, pflags,
+        SftpEvent, SftpRunner, pflags,
     };
+
+    #[cfg(feature = "async")]
     pub use crate::sftpclient::{DirEntry, DirIter};
-    pub use crate::sftpclient::{SftpEvent, SftpRunner};
+    #[cfg(feature = "async")]
+    pub use crate::sftpclient::{PIPELINE_DEPTH, RemoteHandle, SftpClient};
 }
 
 /// SFTP Protocol types and structures
@@ -179,6 +207,7 @@ pub mod protocol {
     pub use crate::proto::PathInfo;
     pub use crate::proto::SftpPacket;
     pub use crate::proto::StatusCode;
+    pub use crate::sftpsink::SftpSink;
     /// Constants that might be useful for SFTP developers
     pub mod constants {
         pub use crate::proto::MAX_HANDLE_LEN;
@@ -196,5 +225,7 @@ pub mod error {
 }
 
 // Re-exports
-pub use embedded_io_async;
 pub use sunset;
+
+#[cfg(feature = "async")]
+pub use embedded_io_async;

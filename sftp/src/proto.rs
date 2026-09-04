@@ -1,8 +1,10 @@
 use crate::sftperror::SftpResult;
 
+#[cfg(any(feature = "async", test))]
+use sunset::sshwire;
 use sunset::sshwire::{
-    self, BinString, SSHDecode, SSHEncode, SSHEncodeEnum, SSHSink, SSHSource,
-    TextString, WireError, WireResult,
+    BinString, SSHDecode, SSHEncode, SSHEncodeEnum, SSHSink, SSHSource, TextString,
+    WireError, WireResult,
 };
 use sunset_sshwire_derive::{SSHDecode, SSHEncode};
 
@@ -25,18 +27,22 @@ pub const SFTP_MINIMUM_PACKET_LEN: usize = 9;
 /// and "peer did something wrong" in error responses.
 pub(crate) const SFTP_MAXIMUM_PACKET_LEN: usize = 34000;
 
+#[cfg(feature = "async")]
 pub const SFTP_FIELD_LEN_INDEX: usize = 0;
 /// SFTP packets length field us u32
 pub const SFTP_FIELD_LEN_LENGTH: usize = 4;
 /// SFTP packets have the packet type after a u32 length field
+#[cfg(feature = "async")]
 pub const SFTP_FIELD_ID_INDEX: usize = 4;
 #[allow(unused)]
 /// SFTP packets ID length is 1 byte
 pub const SFTP_FIELD_ID_LEN: usize = 1;
 
 /// SFTP packets have the packet request id after field id
+#[cfg(feature = "async")]
 pub const SFTP_FIELD_REQ_ID_INDEX: usize = 5;
 /// SFTP packets ID length is 1 byte
+#[cfg(feature = "async")]
 pub const SFTP_FIELD_REQ_ID_LEN: usize = 4;
 
 /// The maximum size for full paths is only limited by the u32 where ssh strings lengths are contained. This causes that
@@ -262,6 +268,7 @@ pub struct Write<'a> {
     pub data_len: u32,
 }
 
+#[cfg(feature = "async")]
 impl Write<'_> {
     pub(crate) const PEEK_NEEDED: usize = 4;
 
@@ -450,6 +457,8 @@ const EXT_NAMES: [&str; 5] = [
 ];
 
 impl Extensions {
+    // Only the server side announces extensions
+    #[cfg(feature = "async")]
     fn enabled(&self) -> [bool; 5] {
         [self.posix_rename, self.hardlink, self.fsync, self.statvfs, self.limits]
     }
@@ -473,6 +482,7 @@ impl Extensions {
     }
 
     /// Encoded length of the announcement pairs.
+    #[cfg(feature = "async")]
     pub(crate) fn encoded_len(&self) -> usize {
         self.enabled()
             .iter()
@@ -484,6 +494,7 @@ impl Extensions {
     }
 
     /// Encodes the announcement pairs, as they follow a `SSH_FXP_VERSION`.
+    #[cfg(feature = "async")]
     pub(crate) fn enc_pairs(&self, s: &mut dyn SSHSink) -> WireResult<()> {
         for (_, n) in self.enabled().iter().zip(EXT_NAMES).filter(|(on, _)| **on) {
             TextString(n.as_bytes()).enc(s)?;
@@ -540,6 +551,7 @@ pub struct Data<'a> {
 /// encoded [`SftpPacket::Data`] variant
 ///
 /// See [Responses from the Server to the Client](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.4)
+#[cfg(feature = "async")]
 pub(crate) const ENCODED_SSH_FXP_DATA_HEADER: u32 = 1 + 4 + 4;
 
 /// This is the encoded length for the [`Name`] Sftp Response Header.
@@ -554,6 +566,7 @@ pub(crate) const ENCODED_SSH_FXP_DATA_HEADER: u32 = 1 + 4 + 4;
 /// encoded [`SftpPacket::Name`] variant
 ///
 /// See [Responses from the Server to the Client](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.4)
+#[cfg(feature = "async")]
 pub(crate) const ENCODED_SSH_FXP_NAME_HEADER: u32 = 1 + 4 + 4;
 
 /// Struct to hold `SSH_FXP_NAME` response.
@@ -1206,7 +1219,9 @@ sftpmessages! [
 #[cfg(test)]
 mod proto_tests {
     use super::*;
-    use crate::server::SftpSink;
+    use crate::protocol::SftpSink;
+    // The server's incoming-packet decoder, which is part of the async layer
+    #[cfg(feature = "async")]
     use crate::sftpsource::{SftpDecoded, SftpSource};
 
     // TODO: There are always more test that can be done
@@ -1216,6 +1231,7 @@ mod proto_tests {
     #[cfg(test)]
     use std::println;
 
+    #[cfg(feature = "async")]
     #[test]
     fn test_data_roundtrip() {
         let data_slice = b"Hello, world!".as_slice();
@@ -1316,6 +1332,7 @@ mod proto_tests {
         assert_eq!(len, buf.len() - 4);
     }
 
+    #[cfg(feature = "async")]
     #[test]
     fn test_packet_open_reading() {
         let mut buff_open_read = [

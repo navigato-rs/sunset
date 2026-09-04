@@ -2,6 +2,9 @@
 //!
 //! Requests that the client wouldn't send, such as an unknown extension
 //! or a malformed payload, only reach the server this way.
+//!
+//! Needs the async layer, so this file is empty without it.
+#![cfg(feature = "async")]
 
 mod common;
 

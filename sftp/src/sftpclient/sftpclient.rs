@@ -5,42 +5,15 @@ use sunset::sshwire::{SSHEncode, TextString};
 
 use crate::error::{SftpError, SftpResult};
 use crate::proto::{
-    Attrs, MAX_HANDLE_LEN, MAX_PATH_LEN, MAX_REQUEST_LEN, Rename, ReqId, StatusCode,
+    Attrs, MAX_HANDLE_LEN, MAX_REQUEST_LEN, Rename, ReqId, StatusCode,
 };
 use crate::sftpclient::dir::DirIter;
-use crate::sftpclient::runner::{SftpEvent, SftpRunner};
+use crate::sftpclient::runner::{
+    DEFAULT_CLIENT_BUF, MAX_READ_LEN, MAX_WRITE_LEN, SftpEvent, SftpRunner, pflags,
+};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, log, trace, warn};
-
-/// Largest directory entry the client can decode.
-///
-/// A filename, the server's `ls -l` style long name, and attributes.
-pub const MAX_DIR_ENTRY_LEN: usize = 2 * (4 + MAX_PATH_LEN) + 128;
-
-const fn larger(a: usize, b: usize) -> usize {
-    if a > b { a } else { b }
-}
-
-/// Default response buffer size for [`SftpClient`].
-///
-/// Large enough for the largest directory entry a server can send,
-/// which is the biggest thing that has to be buffered.
-pub const DEFAULT_CLIENT_BUF: usize = larger(MAX_REQUEST_LEN, MAX_DIR_ENTRY_LEN);
-
-/// Largest `SSH_FXP_READ` that will be requested in one request.
-///
-/// Matches the OpenSSH client, and keeps a data response within the
-/// 34000 byte packet size that draft-ietf-secsh-filexfer-02 requires
-/// servers to accept. Larger reads are split into several requests.
-pub const MAX_READ_LEN: u32 = 32 * 1024;
-
-/// Largest `SSH_FXP_WRITE` that will be sent in one request.
-///
-/// Servers commonly refuse packets beyond the 34000 bytes the draft
-/// requires them to accept. Larger writes are split into several
-/// requests.
-pub const MAX_WRITE_LEN: u32 = 32 * 1024;
 
 /// Number of requests kept in flight during a transfer.
 ///
@@ -58,19 +31,6 @@ pub const PIPELINE_DEPTH: usize = 8;
 
 /// Shorthand within this module.
 const PIPELINE: usize = PIPELINE_DEPTH;
-
-/// Flags for [`SftpClient::open`].
-///
-/// See [Opening, creating and closing files](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.3).
-#[allow(missing_docs)]
-pub mod pflags {
-    pub const READ: u32 = 0x00000001;
-    pub const WRITE: u32 = 0x00000002;
-    pub const APPEND: u32 = 0x00000004;
-    pub const CREAT: u32 = 0x00000008;
-    pub const TRUNC: u32 = 0x00000010;
-    pub const EXCL: u32 = 0x00000020;
-}
 
 /// Records the lowest numbered chunk that came back short.
 ///
@@ -196,6 +156,28 @@ enum Reply {
 ///
 /// Requests are made one at a time, except within a single
 /// [`read()`](Self::read), which pipelines.
+///
+/// ```
+/// use sunset_sftp::client::SftpClient;
+/// use sunset_sftp::embedded_io_async::{Read, Write};
+/// use sunset_sftp::error::SftpResult;
+///
+/// // chan_in and chan_out are the two halves of the SFTP channel.
+/// async fn upload(
+///     chan_in: impl Read,
+///     chan_out: impl Write,
+///     data: &[u8],
+/// ) -> SftpResult<()> {
+///     let mut client = SftpClient::new_default_buffer(chan_in, chan_out);
+///     client.init().await?;
+///
+///     let f = client.create("/tmp/hello").await?;
+///     for (i, chunk) in data.chunks(4096).enumerate() {
+///         client.write(&f, (i * 4096) as u64, chunk).await?;
+///     }
+///     client.close(&f).await
+/// }
+/// ```
 pub struct SftpClient<R: Read, W: Write, const BUF: usize> {
     reader: R,
     writer: W,
