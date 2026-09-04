@@ -82,7 +82,7 @@ impl Client {
     /// Reads until the runner has something to say.
     fn wait_event(&mut self) -> SftpResult<()> {
         while !self.runner.has_event() {
-            let dest = self.runner.input_buf();
+            let dest = self.runner.want_buf();
             assert!(!dest.is_empty(), "nowhere to read into");
             let n = self.stdout.read(dest).map_err(|_| SftpError::Disconnected)?;
             if n == 0 {
