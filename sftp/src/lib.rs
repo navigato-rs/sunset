@@ -52,6 +52,17 @@
 //! pipelined so that a download isn't limited to one chunk per round
 //! trip. Writes wait for each reply, see [`SftpClient::write`](client::SftpClient::write).
 //!
+//! ## Without async
+//!
+//! [`SftpClient`](client::SftpClient) is a thin layer of IO over
+//! [`SftpRunner`](client::SftpRunner), which is the protocol on its
+//! own and performs no IO at all: requests go in, bytes come out, bytes
+//! go in, [events](client::SftpEvent) come out. That is the same shape
+//! as [`sunset::Runner`], and for the same reasons — the caller decides
+//! how the bytes move, so it works from a blocking loop, an interrupt
+//! handler, or a test that feeds it byte by byte. File data is never
+//! copied through it.
+//!
 //! # Roadmap
 //!
 //! The following list is an opinionated collection of the points that should be
@@ -90,6 +101,8 @@
 //!
 //! - [x] A commandline SFTP client, `sftpc` in `sunset-stdasync`
 //! - [x] Pipelining reads, to avoid a round trip per block downloaded
+//! - [x] A sans-io core, [`SftpRunner`](client::SftpRunner), so the
+//!   protocol isn't tied to `embedded_io_async`
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -146,10 +159,11 @@ pub mod server {
 pub mod client {
     pub use crate::proto::Extensions;
     pub use crate::sftpclient::{
-        DEFAULT_CLIENT_BUF, MAX_READ_LEN, MAX_WRITE_LEN, PIPELINE_DEPTH,
-        RemoteHandle, SftpClient, pflags,
+        DEFAULT_CLIENT_BUF, MAX_DIR_ENTRY_LEN, MAX_READ_LEN, MAX_WRITE_LEN,
+        PIPELINE_DEPTH, RemoteHandle, SftpClient, pflags,
     };
     pub use crate::sftpclient::{DirEntry, DirIter};
+    pub use crate::sftpclient::{SftpEvent, SftpRunner};
 }
 
 /// SFTP Protocol types and structures

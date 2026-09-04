@@ -27,8 +27,10 @@ A SSH client and server implementation. This is a fork of
   `sftpc` is a commandline SFTP client using `sunset-sftp`.
 
 - [`sunset-sftp`](sftp/) implements an SFTP server and client. An example of the
-  application side is in [demo/sftp/std](demo/sftp/std). `sunset-sftp` is currently
-  under development, treat as alpha status.
+  application side is in [demo/sftp/std](demo/sftp/std). The client's core,
+  `SftpRunner`, performs no IO of its own, the same as `sunset::Runner`;
+  `SftpClient` is the `embedded_io_async` wrapper over it. `sunset-sftp` is
+  currently under development, treat as alpha status.
 
 ## SSH Features
 
