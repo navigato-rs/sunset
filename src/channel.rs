@@ -1237,26 +1237,39 @@ impl core::fmt::Debug for CliSessionOpener<'_, '_> {
     }
 }
 
+/// How a remote process finished
 #[derive(Debug)]
-pub enum CliSessionExit<'g> {
+pub enum SessionExit<'g> {
     /// Remote process exited with an exit status code
     Status(u32),
     /// Remote process exited by signal
     Signal(ExitSignal<'g>),
 }
 
+/// A remote process finished
+#[derive(Debug)]
+pub struct CliSessionExit<'g> {
+    /// The channel the process was running on.
+    ///
+    /// Several channels may be open at once, so this says whose exit
+    /// this is.
+    pub num: ChanNum,
+    /// How it finished
+    pub exit: SessionExit<'g>,
+}
+
 impl<'g> CliSessionExit<'g> {
     pub fn new(p: &Packet<'g>) -> Result<Self> {
-        match p {
-            Packet::ChannelRequest(ChannelRequest {
-                req: ChannelReqType::ExitStatus(e),
-                ..
-            }) => Ok(Self::Status(e.status)),
-            Packet::ChannelRequest(ChannelRequest {
-                req: ChannelReqType::ExitSignal(e),
-                ..
-            }) => Ok(Self::Signal(e.clone())),
-            _ => Error::bug(),
-        }
+        let Packet::ChannelRequest(ChannelRequest { num, req, .. }) = p else {
+            return Error::bug();
+        };
+        let exit = match req {
+            ChannelReqType::ExitStatus(e) => SessionExit::Status(e.status),
+            ChannelReqType::ExitSignal(e) => SessionExit::Signal(e.clone()),
+            _ => return Error::bug(),
+        };
+        // The number an incoming request carries is our own for the
+        // channel, the same as elsewhere in dispatch().
+        Ok(Self { num: ChanNum(*num), exit })
     }
 }
