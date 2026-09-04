@@ -42,6 +42,8 @@ mod client;
 mod servauth;
 mod server;
 
+#[cfg(feature = "agent")]
+pub mod agent;
 mod auth;
 mod channel;
 mod runner;
@@ -55,6 +57,7 @@ use conn::DispatchEvent;
 pub use sshwire::TextString;
 
 pub use auth::AuthSigMsg;
+pub use channel::SessionExit;
 pub use channel::{ChanData, ChanNum, CliSessionExit, CliSessionOpener};
 pub use channel::{ChanOpened, Pty, SessionCommand};
 pub use error::{Error, Result};

@@ -388,7 +388,7 @@ impl CmdlineClient {
                     }
                     CliEvent::SessionExit(ex) => {
                         trace!("session exit {ex:?}");
-                        if let sunset::CliSessionExit::Status(u) = ex {
+                        if let sunset::SessionExit::Status(u) = ex.exit {
                             // waitpid() on Linux is limited to u8, so we
                             // can't represent the u32 from the SSH protocol anyway.
                             exit_code = ((u & 0xff) as u8).into();
