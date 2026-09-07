@@ -217,3 +217,56 @@ fn configuration_builds_a_working_route() {
         b"config-ok",
     );
 }
+
+#[test]
+#[ignore = "disposable sshd fixture"]
+fn eof_closes_only_stdin_and_retains_nonzero_exit() {
+    for hops in 0..=2 {
+        let mut channel = Connection::connect(&options(hops))
+            .unwrap()
+            .exec("cat; printf diagnostic >&2; exit 7")
+            .unwrap();
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        let input = vec![b'x'; 131072];
+        let mut written = 0;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut eof_sent = false;
+        let mut buf = [0; 8192];
+        while !channel.finished() {
+            if written < input.len() {
+                match channel.write(&input[written..]) {
+                    Ok(n) => written += n,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                    Err(e) => panic!("write: {e}"),
+                }
+            } else if !eof_sent {
+                match channel.finish_input() {
+                    Ok(()) => eof_sent = true,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                    Err(e) => panic!("EOF: {e}"),
+                }
+            }
+            match channel.read(&mut buf) {
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => panic!("read: {e}"),
+            }
+            match channel.read_stderr(&mut buf) {
+                Ok(n) => err.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => panic!("stderr: {e}"),
+            }
+            channel.wait(deadline).unwrap();
+        }
+        assert!(eof_sent);
+        assert_eq!(out, input);
+        assert_eq!(err, b"diagnostic");
+        assert_eq!(channel.exit_status(), Some(&sunset_client::ExitStatus::Code(7)));
+        assert_eq!(
+            channel.write(b"late").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        channel.finish_input().unwrap();
+    }
+}

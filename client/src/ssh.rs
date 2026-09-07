@@ -219,6 +219,8 @@ pub struct Connection {
     stdout: collections::VecDeque<u8>,
     stderr: collections::VecDeque<u8>,
     closed: bool,
+    sent_eof: bool,
+    exit_status: Option<ExitStatus>,
 }
 
 impl Connection {
@@ -315,6 +317,8 @@ impl Connection {
             stdout: collections::VecDeque::new(),
             stderr: collections::VecDeque::new(),
             closed: false,
+            sent_eof: false,
+            exit_status: None,
         };
         while !connection.authenticated {
             remaining(deadline)?;
@@ -591,8 +595,24 @@ impl Connection {
                             // ends the channel).
                             self.started = true;
                         }
-                        sunset::CliEvent::SessionExit(_)
-                        | sunset::CliEvent::Banner(_) => {}
+                        sunset::CliEvent::SessionExit(event) => {
+                            if self.handle.as_ref().map(sunset::ChanHandle::num)
+                                != Some(event.num)
+                            {
+                                return Err(transport(
+                                    "exit status for unknown channel",
+                                ));
+                            }
+                            self.exit_status = Some(match event.exit {
+                                sunset::SessionExit::Status(code) => {
+                                    ExitStatus::Code(code)
+                                }
+                                sunset::SessionExit::Signal(ref signal) => {
+                                    ExitStatus::Signal(signal.signal.to_string())
+                                }
+                            });
+                        }
+                        sunset::CliEvent::Banner(_) => {}
                         sunset::CliEvent::Defunct => self.closed = true,
                         sunset::CliEvent::PollAgain => {}
                     }
@@ -812,6 +832,13 @@ enum ClientSession {
     Subsystem(String),
 }
 
+/// The outcome reported by the server, distinct from stream EOF.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExitStatus {
+    Code(u32),
+    Signal(String),
+}
+
 pub struct Channel {
     connection: Connection,
 }
@@ -839,15 +866,53 @@ impl Channel {
             && self.connection.stdout.is_empty()
             && self.connection.stderr.is_empty()
     }
+    /// The server's exit status, when supplied. EOF alone does not imply success.
+    pub fn exit_status(&self) -> Option<&ExitStatus> {
+        self.connection.exit_status.as_ref()
+    }
+
+    /// Output has drained and the server has supplied an outcome or closed the channel.
+    pub fn finished(&self) -> bool {
+        self.eof() && (self.exit_status().is_some() || self.closed())
+    }
+
+    fn closed(&self) -> bool {
+        self.connection.closed
+            || self.connection.handle.as_ref().is_some_and(|handle| {
+                self.connection.runner.is_channel_closed(handle)
+                    || self.connection.runner.is_channel_finished(handle)
+            })
+    }
+
+    /// Close stdin after all previously accepted writes. Nonblocking and idempotent:
+    /// retry on WouldBlock, just like flush. Reads remain available afterwards.
+    pub fn finish_input(&mut self) -> io::Result<()> {
+        if !self.connection.sent_eof {
+            self.connection
+                .drive(time::Instant::now() + self.timeout())
+                .map_err(io::Error::other)?;
+            let handle = self.connection.handle.as_ref().expect("opened channel");
+            match self.connection.runner.send_channel_eof(handle) {
+                Ok(()) => self.connection.sent_eof = true,
+                Err(
+                    sunset::Error::NoRoom { .. }
+                    | sunset::Error::BusySend { unsupported: false, .. },
+                ) => return Err(io::ErrorKind::WouldBlock.into()),
+                Err(error) => return Err(io::Error::other(protocol(error))),
+            }
+        }
+        io::Write::flush(self)
+    }
+
     pub fn wait(&mut self, deadline: time::Instant) -> Result<(), Error> {
         remaining(deadline)?;
         // A full application queue can stop the pump without new progress.
         // Those bytes are already readable; waiting on the socket deadlocks
         // when the peer is itself waiting for our receive window to reopen.
-        if self.readable() || self.eof() {
+        if self.readable() || self.closed() {
             return Ok(());
         }
-        if !self.connection.drive(deadline)? && !self.readable() && !self.eof() {
+        if !self.connection.drive(deadline)? && !self.readable() && !self.closed() {
             self.connection.wait_ready(deadline)?;
         }
         Ok(())
@@ -864,7 +929,7 @@ impl Channel {
         let _ = self.connection.transport.socket().shutdown(net::Shutdown::Both);
     }
     fn write_buffered(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.connection.channel_eof() {
+        if self.connection.sent_eof || self.connection.channel_eof() {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         let handle = self.connection.handle.as_ref().expect("exec opened channel");
