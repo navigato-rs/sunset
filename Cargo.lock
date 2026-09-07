@@ -2739,6 +2739,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2959,6 +2970,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3"
 dependencies = [
  "ctutils",
+ "ed25519-dalek",
  "p256",
  "rand_core 0.10.1",
  "rsa",
@@ -3076,6 +3088,22 @@ dependencies = [
  "portable-atomic",
  "sunset",
  "tokio",
+]
+
+[[package]]
+name = "sunset-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "hmac",
+ "polling",
+ "sha1",
+ "signature",
+ "ssh-key",
+ "sunset",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
