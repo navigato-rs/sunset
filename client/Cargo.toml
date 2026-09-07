@@ -1,0 +1,22 @@
+[package]
+name = "sunset-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Bounded desktop SSH client and OpenSSH configuration for Sunset"
+repository = "https://github.com/navigato-rs/sunset"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+hmac = "0.13"
+sha1 = "0.11"
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519", "rsa", "p256"] }
+signature = "3"
+zeroize = "1"
+polling = "3.11"
+sunset = { path = "..", version = "0.6", default-features = false, features = ["std", "rsa", "ecdsa256", "larger"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security"] }

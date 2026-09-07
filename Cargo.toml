@@ -11,6 +11,7 @@ rust-version = "1.95"
 
 [workspace]
 members = [
+    "client",
     "demo/picow",
     "demo/std",
     "demo/sftp/std",
