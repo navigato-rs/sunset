@@ -1,6 +1,6 @@
 //! Embedded SSH with Sunset and RustCrypto; no libssh2, OpenSSL, or SSH subprocess.
 //!
-//! Run connection setup off the event thread. One nonblocking socket owns one exec channel;
+//! Run connection setup off the event thread. A bounded route shares one root socket;
 //! bounded queues preserve stdout/stderr separation and apply backpressure. The
 //! system resolver and local file/agent connection setup can still block.
 
@@ -13,25 +13,27 @@ mod trust;
 const MAX_QUEUED_STDOUT: usize = 1024 * 1024;
 const MAX_QUEUED_STDERR: usize = 64 * 1024;
 const DRIVE_BUDGET: usize = 512;
+pub const MAX_JUMPS: usize = 4;
 
 /// How this connection will offer public keys.
 ///
-/// Files are tried in order, then the agent, matching `ssh` unless
-/// `IdentitiesOnly` closed the agent path. Agent-held `sk-ssh-ed25519`
+/// Files are tried in order, then permitted agent identities. Agent-held `sk-ssh-ed25519`
 /// keys are offered; `sk-ecdsa-*` is listed as skipped.
 #[derive(Clone, Debug)]
 pub struct Authentication {
     pub files: Vec<path::PathBuf>,
     pub agent: bool,
+    /// Only configured identities may be offered, including by the agent.
+    pub identities_only: bool,
 }
 
 impl Authentication {
     pub fn identity(path: path::PathBuf) -> Self {
-        Self { files: vec![path], agent: false }
+        Self { files: vec![path], agent: false, identities_only: true }
     }
 
     pub fn agent() -> Self {
-        Self { files: Vec::new(), agent: true }
+        Self { files: Vec::new(), agent: true, identities_only: false }
     }
 }
 
@@ -47,10 +49,28 @@ pub struct Options {
     pub host_key_alias: Option<String>,
     /// Per-operation timeout. OS hostname resolution is not covered by this.
     pub timeout: time::Duration,
+    /// Ordered bastions. Nested routes are rejected before any network access.
+    pub jumps: Vec<Options>,
 }
 
 impl Options {
     pub fn validate(&self) -> Result<(), Error> {
+        if self.jumps.len() > MAX_JUMPS
+            || self.jumps.iter().any(|hop| !hop.jumps.is_empty())
+        {
+            return Err(Error::new(
+                Kind::Configuration,
+                "ProxyJump allows at most four non-nested hops",
+            ));
+        }
+        self.validate_endpoint()?;
+        for hop in &self.jumps {
+            hop.validate_endpoint()?;
+        }
+        Ok(())
+    }
+
+    fn validate_endpoint(&self) -> Result<(), Error> {
         if self.host.is_empty()
             || self.host.len() > 255
             || !self
@@ -116,7 +136,7 @@ pub enum Kind {
     Timeout,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Error {
     pub kind: Kind,
     detail: String,
@@ -181,7 +201,7 @@ pub fn agent_available() -> bool {
 
 pub struct Connection {
     runner: sunset::Runner<'static, sunset::Client>,
-    socket: net::TcpStream,
+    transport: Transport,
     poller: sync::Arc<polling::Poller>,
     wake_pending: sync::Arc<sync::atomic::AtomicBool>,
     events: polling::Events,
@@ -203,10 +223,37 @@ pub struct Connection {
 
 impl Connection {
     pub fn connect(options: &Options) -> Result<Self, Error> {
+        // Preflight every endpoint before DNS, sockets, keys, or agent access.
         options.validate()?;
+        let mut route = options.jumps.iter().chain(std::iter::once(options));
+        let first = route.next().expect("route includes its destination");
+        let mut connection = Self::connect_direct(first)?;
+        for endpoint in route {
+            let deadline = time::Instant::now() + endpoint.timeout;
+            let trust = trust::Store::load(&endpoint.known_hosts)?;
+            let channel = connection.open_forward_until(
+                &endpoint.host,
+                endpoint.port,
+                deadline,
+            )?;
+            let poller = sync::Arc::clone(&channel.connection.poller);
+            let wake_pending = sync::Arc::clone(&channel.connection.wake_pending);
+            connection = Self::authenticate(
+                endpoint,
+                trust,
+                Transport::Forward(Box::new(channel)),
+                poller,
+                wake_pending,
+                deadline,
+            )?;
+        }
+        Ok(connection)
+    }
+
+    fn connect_direct(options: &Options) -> Result<Self, Error> {
         let trust = trust::Store::load(&options.known_hosts)?;
-        // The OS resolver isn't cancellable through ToSocketAddrs. Connection
-        // and authentication deadlines start after it returns; never run on UI.
+        // Only the first hop uses the local resolver. Bastions resolve the rest.
+        // ToSocketAddrs and local configuration access can still block.
         let addresses = net::ToSocketAddrs::to_socket_addrs(&(
             options.host.as_str(),
             options.port,
@@ -227,14 +274,32 @@ impl Connection {
         let socket = socket.ok_or_else(|| transport(last_error))?;
         configure_stream(&socket)?;
         let poller = sync::Arc::new(polling::Poller::new().map_err(transport)?);
-        // SAFETY: Connection owns this socket and deregisters it before drop.
+        // SAFETY: only the root Connection owns and deregisters this socket.
         unsafe { poller.add(&socket, polling::Event::readable(0)) }
             .map_err(transport)?;
+        Self::authenticate(
+            options,
+            trust,
+            Transport::Socket(socket),
+            poller,
+            sync::Arc::new(sync::atomic::AtomicBool::new(false)),
+            deadline,
+        )
+    }
+
+    fn authenticate(
+        options: &Options,
+        trust: trust::Store,
+        wire: Transport,
+        poller: sync::Arc<polling::Poller>,
+        wake_pending: sync::Arc<sync::atomic::AtomicBool>,
+        deadline: time::Instant,
+    ) -> Result<Self, Error> {
         let mut connection = Self {
             runner: sunset::Runner::new_client_owned(),
-            socket,
+            transport: wire,
             poller,
-            wake_pending: sync::Arc::new(sync::atomic::AtomicBool::new(false)),
+            wake_pending,
             events: polling::Events::new(),
             options: options.clone(),
             trust,
@@ -328,10 +393,16 @@ impl Connection {
     /// remote helper — the server does the connecting, exactly as OpenSSH's own
     /// jump host does. The host key of this hop is verified before the channel
     /// is opened, like every other connection.
-    pub fn open_forward(
+    pub fn open_forward(self, address: &str, port: u16) -> Result<Channel, Error> {
+        let deadline = time::Instant::now() + self.options.timeout;
+        self.open_forward_until(address, port, deadline)
+    }
+
+    fn open_forward_until(
         mut self,
         address: &str,
         port: u16,
+        deadline: time::Instant,
     ) -> Result<Channel, Error> {
         if address.is_empty() || address.len() > 255 || port == 0 {
             return Err(Error::new(
@@ -339,7 +410,6 @@ impl Connection {
                 "invalid forwarding destination",
             ));
         }
-        let deadline = time::Instant::now() + self.options.timeout;
         let handle = self
             .runner
             // The origin is informational and commonly logged by the server.
@@ -388,14 +458,25 @@ impl Connection {
     /// Advance bounded network/protocol work without blocking the socket.
     /// Caller data is never retried across a new connection.
     fn drive(&mut self, deadline: time::Instant) -> Result<bool, Error> {
+        self.pump(deadline, DRIVE_BUDGET)
+    }
+
+    fn pump(
+        &mut self,
+        deadline: time::Instant,
+        steps: usize,
+    ) -> Result<bool, Error> {
         if self.closed {
             return Ok(false);
         }
         let mut any_progress = false;
-        for _ in 0..DRIVE_BUDGET {
+        for _ in 0..steps {
+            remaining(deadline)?;
+            // Each nested connection gets one step, not another whole budget.
+            let mut progressed = self.transport.pump(deadline)?;
             // Drain an existing data packet before asking the protocol to move
             // on. A full queue stops network reads rather than dropping output.
-            let mut progressed = self.drain_channel()?;
+            progressed |= self.drain_channel()?;
             if self.runner.read_channel_ready().is_some() {
                 return Ok(any_progress || progressed);
             }
@@ -531,7 +612,7 @@ impl Connection {
             if self.runner.is_input_ready() {
                 if self.incoming_offset == self.incoming.len() {
                     let mut buffer = [0; 16 * 1024];
-                    match io::Read::read(&mut self.socket, &mut buffer) {
+                    match self.transport.read(&mut buffer) {
                         Ok(0) => {
                             self.runner.close_input();
                             progressed = true;
@@ -546,7 +627,7 @@ impl Connection {
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                             progressed = true
                         }
-                        Err(error) => return Err(transport(error)),
+                        Err(error) => return Err(from_io(error)),
                     }
                 }
                 if self.incoming_offset < self.incoming.len() {
@@ -606,7 +687,7 @@ impl Connection {
         if bytes.is_empty() {
             return Ok(false);
         }
-        match io::Write::write(&mut self.socket, bytes) {
+        match self.transport.write(bytes) {
             Ok(0) => Err(transport(
                 "SSH socket closed during write; delivery is uncertain",
             )),
@@ -616,17 +697,20 @@ impl Connection {
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(true),
-            Err(error) => Err(transport(error)),
+            Err(error) => Err(from_io(error)),
         }
     }
 
     fn wait_ready(&mut self, deadline: time::Instant) -> Result<(), Error> {
-        let interest = if self.runner.is_output_pending() {
+        if self.transport.buffered() {
+            return Ok(());
+        }
+        let interest = if self.output_pending() {
             polling::Event::all(0)
         } else {
             polling::Event::readable(0)
         };
-        self.poller.modify(&self.socket, interest).map_err(transport)?;
+        self.poller.modify(self.transport.socket(), interest).map_err(transport)?;
         loop {
             self.events.clear();
             match self.poller.wait(&mut self.events, Some(remaining(deadline)?)) {
@@ -636,9 +720,13 @@ impl Connection {
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(transport(error)),
+                Err(error) => return Err(from_io(error)),
             }
         }
+    }
+
+    fn output_pending(&self) -> bool {
+        self.runner.is_output_pending() || self.transport.output_pending()
     }
 
     fn channel_eof(&self) -> bool {
@@ -656,8 +744,66 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.poller.delete(&self.socket);
-        let _ = self.socket.shutdown(net::Shutdown::Both);
+        if let Transport::Socket(ref socket) = self.transport {
+            let _ = self.poller.delete(socket);
+            let _ = socket.shutdown(net::Shutdown::Both);
+        }
+    }
+}
+
+enum Transport {
+    Socket(net::TcpStream),
+    Forward(Box<Channel>),
+}
+
+impl Transport {
+    fn socket(&self) -> &net::TcpStream {
+        match *self {
+            Self::Socket(ref socket) => socket,
+            Self::Forward(ref channel) => channel.connection.transport.socket(),
+        }
+    }
+
+    fn pump(&mut self, deadline: time::Instant) -> Result<bool, Error> {
+        match *self {
+            Self::Socket(_) => Ok(false),
+            Self::Forward(ref mut channel) => channel.connection.pump(deadline, 1),
+        }
+    }
+
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match *self {
+            Self::Socket(ref mut socket) => io::Read::read(socket, bytes),
+            Self::Forward(ref mut channel) => {
+                channel.read_buffered(bytes, sunset::ChanData::Normal)
+            }
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match *self {
+            Self::Socket(ref mut socket) => io::Write::write(socket, bytes),
+            Self::Forward(ref mut channel) => channel.write_buffered(bytes),
+        }
+    }
+
+    fn output_pending(&self) -> bool {
+        match *self {
+            Self::Socket(_) => false,
+            Self::Forward(ref channel) => channel.connection.output_pending(),
+        }
+    }
+
+    fn buffered(&self) -> bool {
+        match *self {
+            Self::Socket(_) => false,
+            Self::Forward(ref channel) => {
+                !channel.connection.stdout.is_empty()
+                    || channel.connection.incoming_offset
+                        < channel.connection.incoming.len()
+                    || channel.connection.transport.buffered()
+            }
+        }
     }
 }
 
@@ -695,17 +841,39 @@ impl Channel {
     }
     pub fn wait(&mut self, deadline: time::Instant) -> Result<(), Error> {
         remaining(deadline)?;
-        if !self.connection.drive(deadline)? && !self.eof() {
+        // A full application queue can stop the pump without new progress.
+        // Those bytes are already readable; waiting on the socket deadlocks
+        // when the peer is itself waiting for our receive window to reopen.
+        if self.readable() || self.eof() {
+            return Ok(());
+        }
+        if !self.connection.drive(deadline)? && !self.readable() && !self.eof() {
             self.connection.wait_ready(deadline)?;
         }
         Ok(())
+    }
+
+    fn readable(&self) -> bool {
+        !self.connection.stdout.is_empty() || !self.connection.stderr.is_empty()
     }
     pub fn read_stderr(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.read_stream(bytes, sunset::ChanData::Stderr)
     }
     pub fn abort(&mut self) {
         self.connection.closed = true;
-        let _ = self.connection.socket.shutdown(net::Shutdown::Both);
+        let _ = self.connection.transport.socket().shutdown(net::Shutdown::Both);
+    }
+    fn write_buffered(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.connection.channel_eof() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let handle = self.connection.handle.as_ref().expect("exec opened channel");
+        let count = self
+            .connection
+            .runner
+            .write_channel(handle, sunset::ChanData::Normal, bytes)
+            .map_err(|error| io::Error::other(protocol(error)))?;
+        if count == 0 { Err(io::ErrorKind::WouldBlock.into()) } else { Ok(count) }
     }
     fn read_stream(
         &mut self,
@@ -718,6 +886,14 @@ impl Channel {
         self.connection
             .drive(time::Instant::now() + self.timeout())
             .map_err(io::Error::other)?;
+        self.read_buffered(bytes, data)
+    }
+
+    fn read_buffered(
+        &mut self,
+        bytes: &mut [u8],
+        data: sunset::ChanData,
+    ) -> io::Result<usize> {
         let eof = self.connection.channel_eof();
         let queue = match data {
             sunset::ChanData::Normal => &mut self.connection.stdout,
@@ -749,23 +925,15 @@ impl io::Write for Channel {
         self.connection
             .drive(time::Instant::now() + self.timeout())
             .map_err(io::Error::other)?;
-        if self.connection.channel_eof() {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        }
-        let handle = self.connection.handle.as_ref().expect("exec opened channel");
-        let count = self
-            .connection
-            .runner
-            .write_channel(handle, sunset::ChanData::Normal, bytes)
-            .map_err(|error| io::Error::other(protocol(error)))?;
+        let count = self.write_buffered(bytes)?;
         self.connection.flush_socket().map_err(io::Error::other)?;
-        if count == 0 { Err(io::ErrorKind::WouldBlock.into()) } else { Ok(count) }
+        Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.connection
             .drive(time::Instant::now() + self.timeout())
             .map_err(io::Error::other)?;
-        if self.connection.runner.is_output_pending() {
+        if self.connection.output_pending() {
             Err(io::ErrorKind::WouldBlock.into())
         } else {
             Ok(())
@@ -881,6 +1049,14 @@ fn protocol(error: sunset::Error) -> Error {
         Kind::Transport
     };
     Error::new(kind, error)
+}
+
+fn from_io(error: io::Error) -> Error {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Error>())
+        .cloned()
+        .unwrap_or_else(|| transport(error))
 }
 
 fn transport(detail: impl fmt::Display) -> Error {

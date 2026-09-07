@@ -1,7 +1,9 @@
 //! Bounded OpenSSH config discovery. Reading config never executes commands.
 //! Supported connection settings use OpenSSH's first-value-wins ordering.
 
-use std::{collections, fs, io, path};
+use std::{collections, fs, io, path, time};
+
+use crate::{Authentication, MAX_JUMPS, Options};
 
 use anyhow::Context;
 
@@ -35,6 +37,8 @@ pub struct Profile {
     pub host_key_alias: Option<String>,
     /// Retain these in the form and refuse to silently bypass them on Connect.
     pub unsupported: Vec<String>,
+    /// Parsed bastions, in connection order. Each resolves its own host profile.
+    pub jumps: Vec<Jump>,
 }
 
 impl Config {
@@ -62,20 +66,53 @@ impl Config {
         })
     }
 
+    /// Parse an in-memory configuration. Includes require `load` instead.
+    pub fn parse(text: &str, home: &path::Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(text.len() as u64 <= MAX_BYTES, "SSH config exceeds 1 MiB");
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            let mut values = words(line)?;
+            if values.is_empty() {
+                continue;
+            }
+            let keyword = values.remove(0).to_ascii_lowercase();
+            anyhow::ensure!(!values.is_empty(), "missing value for {keyword}");
+            anyhow::ensure!(keyword != "include", "Include requires Config::load");
+            lines.push(Line { keyword, values, included: Vec::new() });
+        }
+        let mut aliases = collections::BTreeSet::new();
+        collect_aliases(&lines, &mut aliases);
+        Ok(Self {
+            lines,
+            aliases: aliases.into_iter().collect(),
+            home: home.to_owned(),
+        })
+    }
+
     pub fn aliases(&self) -> &[String] {
         &self.aliases
     }
 
     /// Existing OpenSSH default identities the client can sign, in offer order.
     ///
-    /// OpenSSH offers every default file plus agent keys. the client tries these
-    /// files, then the agent unless IdentitiesOnly is set. Hardware-backed
+    /// Files are tried before agent keys. IdentitiesOnly restricts the identities
+    /// an agent may offer, not whether it may sign. Hardware-backed
     /// `*_sk` files are omitted: they cannot be offered.
     pub fn default_identities(&self) -> Vec<path::PathBuf> {
         default_identities(&self.home)
     }
 
     pub fn resolve(&self, alias: &str) -> anyhow::Result<Profile> {
+        self.resolve_with(alias, None, None, None)
+    }
+
+    fn resolve_with(
+        &self,
+        alias: &str,
+        user: Option<&str>,
+        port: Option<u16>,
+        fallback_user: Option<&str>,
+    ) -> anyhow::Result<Profile> {
         anyhow::ensure!(
             !alias.is_empty()
                 && alias.len() <= 255
@@ -92,12 +129,29 @@ impl Config {
         anyhow::ensure!(!host.contains('%'), "unsupported token in HostName");
         let mut profile = Profile {
             host,
-            user: first("user").cloned(),
-            port: first("port").map(|port| port.parse()).transpose()?,
+            user: user
+                .map(str::to_owned)
+                .or_else(|| first("user").cloned())
+                .or_else(|| fallback_user.map(str::to_owned)),
+            port: port.or(first("port").map(|port| port.parse()).transpose()?),
             identities_only: first("identitiesonly")
                 .is_some_and(|value| value.eq_ignore_ascii_case("yes")),
             ..Profile::default()
         };
+        if let Some(value) = first("proxyjump") {
+            anyhow::ensure!(
+                values["proxyjump"].len() == 1,
+                "ProxyJump expects one route"
+            );
+            profile.jumps = parse_jumps(value)?;
+        }
+        if let Some(value) = first("identitiesonly") {
+            anyhow::ensure!(
+                value.eq_ignore_ascii_case("yes")
+                    || value.eq_ignore_ascii_case("no"),
+                "invalid IdentitiesOnly value"
+            );
+        }
         if let Some(entries) = values.get("identityfile") {
             for value in entries {
                 if value == "none" {
@@ -126,7 +180,6 @@ impl Config {
         // These options change routing, authentication, or trust. Display them
         // as blockers rather than connecting directly or using another identity.
         for (name, neutral) in [
-            ("proxyjump", "none"),
             ("proxycommand", "none"),
             ("certificatefile", "none"),
             ("identityagent", "SSH_AUTH_SOCK"),
@@ -176,6 +229,147 @@ impl Config {
         }
         Ok(profile)
     }
+
+    /// Resolve a route once for browsing, command execution, or reconnect.
+    /// Every hop is checked before the transport opens a socket. Explicit hop
+    /// user/port overrides apply before expanding identity and trust paths.
+    pub fn connection(
+        &self,
+        alias: &str,
+        fallback_user: &str,
+        timeout: time::Duration,
+    ) -> anyhow::Result<Options> {
+        let profile = self.resolve_with(alias, None, None, Some(fallback_user))?;
+        let mut options = self.endpoint(alias, &profile, timeout)?;
+        for jump in &profile.jumps {
+            let hop = self.resolve_with(
+                &jump.alias,
+                jump.user.as_deref(),
+                jump.port,
+                Some(fallback_user),
+            )?;
+            anyhow::ensure!(
+                hop.jumps.is_empty(),
+                "nested ProxyJump on {} is unsupported",
+                jump.alias
+            );
+            options.jumps.push(self.endpoint(&jump.alias, &hop, timeout)?);
+        }
+        options.validate()?;
+        Ok(options)
+    }
+
+    fn endpoint(
+        &self,
+        alias: &str,
+        profile: &Profile,
+        timeout: time::Duration,
+    ) -> anyhow::Result<Options> {
+        anyhow::ensure!(
+            profile.unsupported.is_empty(),
+            "unsupported SSH policy for {alias}: {}",
+            profile.unsupported.join(", ")
+        );
+        Ok(Options {
+            host: profile.host.clone(),
+            user: profile.user.clone().unwrap_or_default(),
+            port: profile.port.unwrap_or(22),
+            known_hosts: profile
+                .known_hosts
+                .clone()
+                .unwrap_or_else(|| self.home.join(".ssh/known_hosts")),
+            host_key_alias: profile.host_key_alias.clone(),
+            authentication: Authentication {
+                files: if profile.identities.is_empty() {
+                    self.default_identities()
+                } else {
+                    profile.identities.clone()
+                },
+                agent: true,
+                identities_only: profile.identities_only,
+            },
+            timeout,
+            jumps: Vec::new(),
+        })
+    }
+}
+
+/// One ProxyJump destination. No credentials or command syntax.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Jump {
+    pub alias: String,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+}
+
+pub fn parse_jumps(route: &str) -> anyhow::Result<Vec<Jump>> {
+    if route == "none" {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(route.len() <= 4096, "ProxyJump route exceeds budget");
+    let mut hops = Vec::new();
+    for item in route.split(',') {
+        anyhow::ensure!(hops.len() < MAX_JUMPS, "too many ProxyJump hops");
+        anyhow::ensure!(
+            !item.is_empty()
+                && !item.chars().any(|c| c.is_control() || c.is_whitespace()),
+            "invalid ProxyJump destination"
+        );
+        // URI forms, percent escapes, and passwords must not be approximated.
+        anyhow::ensure!(
+            !item.contains("://"),
+            "ProxyJump URI syntax is unsupported"
+        );
+        let (user, host) = match item.split_once('@') {
+            Some((user, host)) => {
+                anyhow::ensure!(
+                    !user.is_empty() && !host.contains('@'),
+                    "invalid ProxyJump user"
+                );
+                (Some(user.to_owned()), host)
+            }
+            None => (None, item),
+        };
+        let (alias, port) = if let Some(ip) = host.strip_prefix('[') {
+            let (ip, suffix) = ip
+                .split_once(']')
+                .ok_or_else(|| anyhow::anyhow!("unclosed ProxyJump IPv6 address"))?;
+            ip.parse::<std::net::Ipv6Addr>()?;
+            let port = if suffix.is_empty() {
+                None
+            } else {
+                Some(
+                    suffix
+                        .strip_prefix(':')
+                        .ok_or_else(|| anyhow::anyhow!("invalid ProxyJump port"))?,
+                )
+            };
+            (ip, port)
+        } else {
+            match host.split_once(':') {
+                Some((alias, port)) => {
+                    anyhow::ensure!(
+                        !port.contains(':'),
+                        "bracket IPv6 ProxyJump addresses"
+                    );
+                    (alias, Some(port))
+                }
+                None => (host, None),
+            }
+        };
+        anyhow::ensure!(
+            !alias.is_empty()
+                && alias.len() <= 255
+                && alias
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:_".contains(&b)),
+            "invalid ProxyJump host"
+        );
+        let port: Option<u16> = port.map(str::parse).transpose()?;
+        anyhow::ensure!(port != Some(0), "invalid ProxyJump port");
+        hops.push(Jump { alias: alias.to_owned(), user, port });
+    }
+    Ok(hops)
 }
 
 fn evaluate(
@@ -198,6 +392,15 @@ fn evaluate(
                 evaluate(&line.included, alias, values, match_seen)
             }
             "include" => {}
+            "proxyjump" | "proxycommand" if active => {
+                // OpenSSH treats the first of these two directives as decisive,
+                // including an explicit `none`.
+                if !values.contains_key("proxyjump")
+                    && !values.contains_key("proxycommand")
+                {
+                    values.insert(line.keyword.clone(), line.values.clone());
+                }
+            }
             "identityfile" if active => {
                 values
                     .entry(line.keyword.clone())
@@ -559,21 +762,7 @@ mod tests {
     use super::*;
 
     fn config(text: &str) -> Config {
-        let lines = text
-            .lines()
-            .filter_map(|line| {
-                let mut values = words(line).unwrap();
-                if values.is_empty() {
-                    return None;
-                }
-                Some(Line {
-                    keyword: values.remove(0).to_ascii_lowercase(),
-                    values,
-                    included: Vec::new(),
-                })
-            })
-            .collect();
-        Config { lines, home: "/home/test".into(), ..Config::default() }
+        Config::parse(text, path::Path::new("/home/test")).unwrap()
     }
 
     #[test]
@@ -648,9 +837,10 @@ mod tests {
 
     #[test]
     fn unsupported_routing_and_match_are_never_silently_bypassed() {
-        let config =
-            config("Host remote\nProxyJump gateway\nHost local\nHostName 127.0.0.1");
-        assert_eq!(config.resolve("remote").unwrap().unsupported, ["proxyjump"]);
+        let config = config(
+            "Host remote\nProxyCommand gateway\nHost local\nHostName 127.0.0.1",
+        );
+        assert_eq!(config.resolve("remote").unwrap().unsupported, ["proxycommand"]);
         assert!(config.resolve("local").unwrap().unsupported.is_empty());
         let config = self::config(
             "Match exec \"touch /must-not-run\"\nUser altered\nHost safe\nHostName localhost",
