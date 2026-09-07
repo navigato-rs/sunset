@@ -46,3 +46,24 @@ jobs:
       # dependency on the async layer.
       - name: Test sunset-sftp without async
         run: cargo test -p sunset-sftp --no-default-features
+
+  client:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p sunset-client --all-targets
+      - run: cargo clippy --locked -p sunset-client --all-targets -- -D warnings
+      - name: Disposable SSH route tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          bash client/tests/sshd.sh

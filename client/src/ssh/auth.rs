@@ -1,6 +1,6 @@
 //! Keys are loaded only after the server's host key was accepted.
-//! Identity files are offered first; the local agent is appended unless
-//! `IdentitiesOnly` closed that path. RustCrypto signs files; the agent signs
+//! Identity files are offered first; IdentitiesOnly restricts agent identities
+//! to configured public keys. RustCrypto signs files; the agent signs
 //! its own keys, including `sk-ssh-ed25519` (the authenticator holds the
 //! private half). `sk-ecdsa-*` is still skipped.
 
@@ -35,7 +35,14 @@ impl Credentials {
         let mut keys = collections::VecDeque::new();
         let mut skipped = Vec::new();
         let mut agent = None;
+        let mut allowed = Vec::new();
         for path in &authentication.files {
+            if authentication.identities_only {
+                match public_identity(path) {
+                    Ok(key) => allowed.push(key),
+                    Err(reason) => skipped.push(reason),
+                }
+            }
             match load_file(path) {
                 Ok(prepared) => keys.push_back(prepared),
                 Err(reason) => skipped.push(reason),
@@ -47,6 +54,11 @@ impl Credentials {
                     Ok(listed) => {
                         skipped.extend(listed.skipped);
                         for key in listed.keys {
+                            if authentication.identities_only
+                                && !permitted(&key, &allowed)
+                            {
+                                continue;
+                            }
                             keys.push_back(PreparedKey {
                                 offered: key,
                                 source: KeySource::Agent,
@@ -192,6 +204,46 @@ fn load_file(path: &path::Path) -> Result<PreparedKey, String> {
     Ok(PreparedKey { offered, source: KeySource::File(Box::new(private)) })
 }
 
+fn permitted(key: &sunset::SignKey, allowed: &[Vec<u8>]) -> bool {
+    let mut wire = Vec::new();
+    sunset::sshwire::ssh_push_vec(&mut wire, &key.pubkey()).is_ok()
+        && allowed.contains(&wire)
+}
+
+/// Public material may come from an encrypted private file or an explicitly
+/// named public file. Read it only after host verification, and never offer
+/// unrelated agent identities when these files are missing or malformed.
+fn public_identity(path: &path::Path) -> Result<Vec<u8>, String> {
+    fn read(path: &path::Path) -> Result<Vec<u8>, String> {
+        let file = fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        io::Read::read_to_end(
+            &mut io::Read::take(file, 1024 * 1024 + 1),
+            &mut bytes,
+        )
+        .map_err(|e| e.to_string())?;
+        if bytes.len() > 1024 * 1024 {
+            return Err("identity exceeds 1 MiB".into());
+        }
+        if let Ok(private) = ssh_key::PrivateKey::from_openssh(&*bytes) {
+            return private.public_key().to_bytes().map_err(|e| e.to_string());
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+        ssh_key::PublicKey::from_openssh(text)
+            .and_then(|key| key.to_bytes())
+            .map_err(|e| e.to_string())
+    }
+    read(path)
+        .or_else(|_| {
+            let mut public = path.as_os_str().to_owned();
+            public.push(".pub");
+            read(path::Path::new(&public))
+        })
+        .map_err(|error| {
+            format!("{}: cannot identify allowed agent key: {error}", path.display())
+        })
+}
+
 fn empty_offer(files: usize, wanted_agent: bool, skipped: &[String]) -> String {
     let mut parts = Vec::new();
     if files > 0 {
@@ -242,5 +294,17 @@ mod tests {
     fn empty_offer_without_files_does_not_invent_a_count() {
         let text = empty_offer(0, false, &[]);
         assert_eq!(text, "no identity files and no SSH agent were configured");
+    }
+    #[test]
+    fn identities_only_rejects_unlisted_agent_keys() {
+        let mut wire = b"\0\0\0\x0bssh-ed25519\0\0\0\x20".to_vec();
+        wire.push(0x58);
+        wire.extend_from_slice(&[0x66; 31]);
+        let (public, _) =
+            sunset::sshwire::read_ssh::<sunset::PubKey<'_>>(&wire, None).unwrap();
+        let key = sunset::SignKey::from_agent_pubkey(&public).unwrap();
+        assert!(!permitted(&key, &[]));
+        assert!(!permitted(&key, &[vec![0; wire.len()]]));
+        assert!(permitted(&key, &[wire]));
     }
 }

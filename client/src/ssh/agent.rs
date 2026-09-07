@@ -303,9 +303,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a disposable OpenSSH agent; scripts/test-ssh.sh or scripts/test-windows-agent.py"]
+    #[ignore = "requires client/tests/sshd.sh"]
     fn signs_with_isolated_openssh_agent() {
-        let path = std::env::var_os("STARCOM_AGENT_TEST_PUBKEY")
+        let path = std::env::var_os("SUNSET_AGENT_TEST_PUBKEY")
             .expect("use the agent fixture");
         // An agent is reachable here by construction, so the form's pre-flight
         // check must agree. This is the only place the Windows named-pipe probe
