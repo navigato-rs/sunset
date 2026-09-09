@@ -1,5 +1,5 @@
 use std::{path, time};
-use sunset_client::{Kind, config};
+use sunset_client::{Kind, StrictHostKeyChecking, config};
 
 fn parse(text: &str) -> config::Config {
     config::Config::parse(text, path::Path::new("/tmp/sunset-test")).unwrap()
@@ -29,8 +29,20 @@ fn each_hop_uses_its_own_identity_and_expands_overrides() {
         path::PathBuf::from("/tmp/sunset-test/.ssh/gateway_hosts")
     );
     assert_eq!(first.host_key_alias.as_deref(), Some("gw"));
+    assert_eq!(options.strict_host_key_checking, StrictHostKeyChecking::Yes);
     assert_eq!(options.jumps[1].user, "relay");
     assert!(options.jumps.iter().all(|hop| hop.jumps.is_empty()));
+}
+
+#[test]
+fn connection_carries_stricthostkeychecking_per_hop() {
+    let config = parse(
+        "Host dest\nHostName dest.example\nUser dest\nStrictHostKeyChecking accept-new\nProxyJump bastion\nHost bastion\nHostName gw.example\nUser jump\nStrictHostKeyChecking no\n",
+    );
+    let options =
+        config.connection("dest", "local", time::Duration::from_secs(5)).unwrap();
+    assert_eq!(options.strict_host_key_checking, StrictHostKeyChecking::AcceptNew);
+    assert_eq!(options.jumps[0].strict_host_key_checking, StrictHostKeyChecking::No);
 }
 
 #[test]
