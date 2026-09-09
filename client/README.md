@@ -12,6 +12,12 @@ Each connection owns one exec, subsystem, or forwarding channel. Configuration
 is bounded and never executes local commands. Unsupported routing and security
 policy fails closed. OS DNS and local file access can still block.
 
+`StrictHostKeyChecking` is honoured (`yes`/`ask` refuse unknown keys,
+`accept-new` appends them, `no`/`off` also accepts a changed key). This
+client never prompts, so `ask` matches `yes`. `HashKnownHosts yes` is a
+blocker when a key would be recorded, because hashed writes are not
+implemented.
+
 The client started from Starcom's SSH implementation at
 `d3135b22d4c597b6f0c848fee304b1f8faa3020e` and retains its MIT license.
 The rest of Sunset retains its existing license.

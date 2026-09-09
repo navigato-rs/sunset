@@ -38,6 +38,7 @@ pub struct CmdlineClient {
     username: String,
     host: String,
     port: u16,
+    strict_host_key_checking: StrictHostKeyChecking,
     agent: Option<AgentClient>,
 
     pty_guard: Option<RawPtyGuard>,
@@ -55,6 +56,7 @@ impl CmdlineClient {
             username: username.as_ref().into(),
             host: host.as_ref().into(),
             port: sshnames::SSH_PORT,
+            strict_host_key_checking: StrictHostKeyChecking::Ask,
             authkeys: Default::default(),
             pty: None,
             pty_guard: None,
@@ -63,6 +65,14 @@ impl CmdlineClient {
 
     pub fn port(&mut self, port: u16) -> &mut Self {
         self.port = port;
+        self
+    }
+
+    pub fn strict_host_key_checking(
+        &mut self,
+        checking: StrictHostKeyChecking,
+    ) -> &mut Self {
+        self.strict_host_key_checking = checking;
         self
     }
 
@@ -321,7 +331,10 @@ impl CmdlineClient {
                     CliEvent::Hostkey(h) => {
                         let key = h.hostkey()?;
                         match knownhosts::check_known_hosts(
-                            &self.host, self.port, &key,
+                            &self.host,
+                            self.port,
+                            &key,
+                            self.strict_host_key_checking,
                         ) {
                             Ok(()) => h.accept()?,
                             Err(e) => {

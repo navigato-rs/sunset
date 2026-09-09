@@ -3,7 +3,7 @@
 
 use std::{collections, fs, io, path, time};
 
-use crate::{Authentication, MAX_JUMPS, Options};
+use crate::{Authentication, MAX_JUMPS, Options, StrictHostKeyChecking};
 
 use anyhow::Context;
 
@@ -35,6 +35,8 @@ pub struct Profile {
     pub identities_only: bool,
     /// Known-hosts lookup name, from `HostKeyAlias`. TCP still uses `host`.
     pub host_key_alias: Option<String>,
+    /// OpenSSH `StrictHostKeyChecking`. Defaults to `yes` when unset.
+    pub strict_host_key_checking: StrictHostKeyChecking,
     /// Retain these in the form and refuse to silently bypass them on Connect.
     pub unsupported: Vec<String>,
     /// Parsed bastions, in connection order. Each resolves its own host profile.
@@ -177,6 +179,24 @@ impl Config {
         if let Some(value) = first("hostkeyalias") {
             profile.host_key_alias = Some(expand_name(value, alias, &profile)?);
         }
+        if let Some(value) = first("stricthostkeychecking") {
+            let checking = StrictHostKeyChecking::parse(value).ok_or_else(|| {
+                anyhow::anyhow!("invalid StrictHostKeyChecking value")
+            })?;
+            profile.strict_host_key_checking = checking;
+        }
+        if let Some(value) = first("hashknownhosts") {
+            let hash = value.eq_ignore_ascii_case("yes");
+            anyhow::ensure!(
+                hash || value.eq_ignore_ascii_case("no"),
+                "invalid HashKnownHosts value"
+            );
+            // Hashed lookups already work. Writing a new unhashed name would
+            // ignore HashKnownHosts, so recording policies fail closed.
+            if hash && profile.strict_host_key_checking.records_unknown() {
+                profile.unsupported.push("hashknownhosts".into());
+            }
+        }
         // These options change routing, authentication, or trust. Display them
         // as blockers rather than connecting directly or using another identity.
         for (name, neutral) in [
@@ -279,6 +299,7 @@ impl Config {
                 .clone()
                 .unwrap_or_else(|| self.home.join(".ssh/known_hosts")),
             host_key_alias: profile.host_key_alias.clone(),
+            strict_host_key_checking: profile.strict_host_key_checking,
             authentication: Authentication {
                 files: if profile.identities.is_empty() {
                     self.default_identities()
@@ -667,6 +688,8 @@ impl Reader<'_> {
                     | "identitiesonly"
                     | "identityagent"
                     | "hostkeyalias"
+                    | "stricthostkeychecking"
+                    | "hashknownhosts"
             ) {
                 anyhow::ensure!(
                     parts.len() == 1,
@@ -942,6 +965,51 @@ mod tests {
         assert_eq!(
             Config::load(&root).unwrap().resolve("zork").unwrap().unsupported,
             ["IdentitiesOnly without an explicit IdentityFile"]
+        );
+    }
+
+    #[test]
+    fn stricthostkeychecking_is_parsed_not_ignored() {
+        let profile = config("Host *\nStrictHostKeyChecking accept-new\n")
+            .resolve("dev")
+            .unwrap();
+        assert_eq!(
+            profile.strict_host_key_checking,
+            StrictHostKeyChecking::AcceptNew
+        );
+        assert!(profile.unsupported.is_empty());
+        assert_eq!(
+            config("Host *\nStrictHostKeyChecking ask\n")
+                .resolve("dev")
+                .unwrap()
+                .strict_host_key_checking,
+            StrictHostKeyChecking::Ask
+        );
+        assert_eq!(
+            config("Host *\nStrictHostKeyChecking off\n")
+                .resolve("dev")
+                .unwrap()
+                .strict_host_key_checking,
+            StrictHostKeyChecking::No
+        );
+        assert_eq!(
+            config("Host *\n").resolve("dev").unwrap().strict_host_key_checking,
+            StrictHostKeyChecking::Yes
+        );
+        assert!(
+            config("Host *\nStrictHostKeyChecking maybe\n").resolve("dev").is_err()
+        );
+        let hashed =
+            config("Host *\nHashKnownHosts yes\nStrictHostKeyChecking accept-new\n")
+                .resolve("dev")
+                .unwrap();
+        assert_eq!(hashed.unsupported, ["hashknownhosts"]);
+        assert!(
+            config("Host *\nHashKnownHosts yes\n")
+                .resolve("dev")
+                .unwrap()
+                .unsupported
+                .is_empty()
         );
     }
 }

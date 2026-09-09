@@ -32,6 +32,7 @@ use pty::{RawPtyGuard, raw_pty};
 pub use cmdline_client::CmdlineClient;
 
 pub use agent::AgentClient;
+pub use knownhosts::StrictHostKeyChecking;
 
 // Re-exports
 pub use sunset;

@@ -37,6 +37,42 @@ impl Authentication {
     }
 }
 
+/// OpenSSH `StrictHostKeyChecking`. This client never prompts, so `ask` refuses
+/// unknown keys the same way `yes` does (BatchMode).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StrictHostKeyChecking {
+    /// Refuse unknown and changed keys. Never update known_hosts.
+    #[default]
+    Yes,
+    /// Same refusal as `Yes`. Distinct so a caller can prompt if it wants.
+    Ask,
+    /// Append unknown keys to known_hosts; refuse changed keys.
+    AcceptNew,
+    /// Accept unknown and changed keys. Unknown keys are appended.
+    No,
+}
+
+impl StrictHostKeyChecking {
+    /// Parse an OpenSSH `StrictHostKeyChecking` value.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.to_ascii_lowercase().as_str() {
+            "yes" => Self::Yes,
+            "ask" => Self::Ask,
+            "accept-new" => Self::AcceptNew,
+            "no" | "off" => Self::No,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn records_unknown(self) -> bool {
+        matches!(self, Self::AcceptNew | Self::No)
+    }
+
+    pub(crate) fn allows_changed(self) -> bool {
+        matches!(self, Self::No)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub host: String,
@@ -47,6 +83,8 @@ pub struct Options {
     /// Name used in known_hosts instead of `host`, from `HostKeyAlias`.
     /// TCP still connects to `host`.
     pub host_key_alias: Option<String>,
+    /// OpenSSH `StrictHostKeyChecking`. Defaults to `yes`.
+    pub strict_host_key_checking: StrictHostKeyChecking,
     /// Per-operation timeout. OS hostname resolution is not covered by this.
     pub timeout: time::Duration,
     /// Ordered bastions. Nested routes are rejected before any network access.
@@ -493,15 +531,18 @@ impl Connection {
                                 &check.hostkey().map_err(protocol)?,
                             )
                             .map_err(protocol)?;
-                            // Also applied to subsequent key exchanges. Never
-                            // accept a changed key just because the channel exists.
-                            self.fingerprint = self.trust.verify(
+                            // Subsequent key exchanges use the same policy.
+                            // A changed key is never accepted just because the
+                            // channel exists, unless StrictHostKeyChecking is no.
+                            self.fingerprint = self.trust.verify_with(
                                 self.options
                                     .host_key_alias
                                     .as_deref()
                                     .unwrap_or(&self.options.host),
                                 self.options.port,
                                 &wire,
+                                self.options.strict_host_key_checking,
+                                &self.options.known_hosts,
                             )?;
                             check.accept().map_err(protocol)?;
                             self.verified = true;

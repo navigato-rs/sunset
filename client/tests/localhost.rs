@@ -4,7 +4,9 @@ use std::{
     io::{self, Read, Write},
     path, thread, time,
 };
-use sunset_client::{Authentication, Channel, Connection, Kind, Options};
+use sunset_client::{
+    Authentication, Channel, Connection, Kind, Options, StrictHostKeyChecking,
+};
 
 fn fixture() -> (path::PathBuf, Vec<u16>) {
     let root =
@@ -25,6 +27,7 @@ fn options(hops: usize) -> Options {
         user: env::var("SUNSET_TEST_USER").unwrap(),
         known_hosts: root.join("known_hosts"),
         host_key_alias: None,
+        strict_host_key_checking: StrictHostKeyChecking::Yes,
         authentication: Authentication::identity(root.join(format!("identity{i}"))),
         timeout: time::Duration::from_secs(10),
         jumps: Vec::new(),
@@ -215,5 +218,35 @@ fn configuration_builds_a_working_route() {
     collect(
         Connection::connect(&opts).unwrap().exec("printf config-ok").unwrap(),
         b"config-ok",
+    );
+}
+
+#[test]
+#[ignore = "disposable sshd fixture"]
+fn accept_new_records_an_unknown_host_and_no_allows_a_changed_key() {
+    let (root, _) = fixture();
+    let mut opts = options(0);
+    let recorded = root.join("accept_new_hosts");
+    opts.known_hosts = recorded.clone();
+    opts.strict_host_key_checking = StrictHostKeyChecking::AcceptNew;
+    collect(
+        Connection::connect(&opts).unwrap().exec("printf accept-new").unwrap(),
+        b"accept-new",
+    );
+    assert!(
+        fs::read_to_string(&recorded).unwrap().contains("127.0.0.1"),
+        "accept-new should append the presented host key"
+    );
+    opts.strict_host_key_checking = StrictHostKeyChecking::Yes;
+    collect(
+        Connection::connect(&opts).unwrap().exec("printf recorded").unwrap(),
+        b"recorded",
+    );
+
+    opts.known_hosts = root.join("wrong_hosts");
+    opts.strict_host_key_checking = StrictHostKeyChecking::No;
+    collect(
+        Connection::connect(&opts).unwrap().exec("printf no-check").unwrap(),
+        b"no-check",
     );
 }

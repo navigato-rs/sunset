@@ -4,6 +4,11 @@
 
 ### Added
 
+- `sunsetc` honours `-o StrictHostKeyChecking=` (`yes`, `ask`,
+  `accept-new`, `no`/`off`) instead of ignoring the option. `ask` is
+  still the default and prompts; `yes` refuses unknown keys; `accept-new`
+  records them; `no` also accepts a changed key.
+
 - `CmdlineClient::run_channel()` runs a session like `run()` does, but
   hands the channel to a caller supplied closure rather than connecting
   it to the terminal. For subsystems such as SFTP.

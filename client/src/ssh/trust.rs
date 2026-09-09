@@ -5,7 +5,7 @@
 
 use std::{fs, io, path};
 
-use super::{Error, Kind};
+use super::{Error, Kind, StrictHostKeyChecking};
 use base64::Engine as _;
 use hmac::{KeyInit as _, Mac as _};
 
@@ -26,9 +26,20 @@ enum Hosts {
     Hashed { salt: Vec<u8>, hash: Vec<u8> },
 }
 
+enum Status {
+    Match(String),
+    Unknown(String),
+    Changed(String),
+}
+
 impl Store {
     pub fn load(path: &path::Path) -> Result<Self, Error> {
-        let file = fs::File::open(path).map_err(configuration)?;
+        let file = match fs::File::open(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self { entries: Vec::new() });
+            }
+            other => other.map_err(configuration)?,
+        };
         let mut data = Vec::new();
         io::Read::read_to_end(
             &mut io::Read::take(file, MAX_FILE_BYTES + 1),
@@ -115,20 +126,60 @@ impl Store {
         Ok(Self { entries })
     }
 
+    #[cfg(test)]
     pub fn verify(
         &self,
         host: &str,
         port: u16,
         key: &[u8],
     ) -> Result<String, Error> {
+        match self.status(host, port, key)? {
+            Status::Match(fingerprint) => Ok(fingerprint),
+            Status::Unknown(fingerprint) => {
+                Err(untrusted(Kind::UnknownHostKey, fingerprint))
+            }
+            Status::Changed(fingerprint) => {
+                Err(untrusted(Kind::ChangedHostKey, fingerprint))
+            }
+        }
+    }
+
+    /// Apply `StrictHostKeyChecking`. Unknown keys may be appended; a changed
+    /// key is accepted only for `no`.
+    pub fn verify_with(
+        &mut self,
+        host: &str,
+        port: u16,
+        key: &[u8],
+        checking: StrictHostKeyChecking,
+        known_hosts: &path::Path,
+    ) -> Result<String, Error> {
+        match self.status(host, port, key)? {
+            Status::Match(fingerprint) => Ok(fingerprint),
+            Status::Unknown(fingerprint) if checking.records_unknown() => {
+                self.record(known_hosts, host, port, key)?;
+                Ok(fingerprint)
+            }
+            Status::Unknown(fingerprint) => {
+                Err(untrusted(Kind::UnknownHostKey, fingerprint))
+            }
+            Status::Changed(fingerprint) if checking.allows_changed() => {
+                Ok(fingerprint)
+            }
+            Status::Changed(fingerprint) => {
+                Err(untrusted(Kind::ChangedHostKey, fingerprint))
+            }
+        }
+    }
+
+    fn status(&self, host: &str, port: u16, key: &[u8]) -> Result<Status, Error> {
         let public = ssh_key::PublicKey::from_bytes(key)
             .map_err(|_| Error::new(Kind::Transport, "invalid server public key"))?;
         let fingerprint = public.fingerprint(ssh_key::HashAlg::Sha256).to_string();
         // OpenSSH lowercases the host before matching known_hosts, and hashes the
         // lowercased name. Matching case-sensitively would reject a trusted entry
         // as unknown, which reads as a changed-key warning to the user.
-        let host = host.to_ascii_lowercase();
-        let lookup = if port == 22 { host } else { format!("[{host}]:{port}") };
+        let lookup = lookup_name(host, port);
         let mut found_host = false;
         for entry in &self.entries {
             let matches = match entry.hosts {
@@ -145,17 +196,57 @@ impl Store {
             if matches {
                 found_host = true;
                 if entry.key == key {
-                    return Ok(fingerprint);
+                    return Ok(Status::Match(fingerprint));
                 }
             }
         }
-        Err(Error::new(
-            if found_host { Kind::ChangedHostKey } else { Kind::UnknownHostKey },
-            format!(
-                "host key is not trusted; refusing authentication; presented {fingerprint}"
-            ),
-        ))
+        Ok(if found_host {
+            Status::Changed(fingerprint)
+        } else {
+            Status::Unknown(fingerprint)
+        })
     }
+
+    fn record(
+        &mut self,
+        path: &path::Path,
+        host: &str,
+        port: u16,
+        key: &[u8],
+    ) -> Result<(), Error> {
+        let public = ssh_key::PublicKey::from_bytes(key)
+            .map_err(|_| Error::new(Kind::Transport, "invalid server public key"))?;
+        let lookup = lookup_name(host, port);
+        let line = format!(
+            "{lookup} {} {}\n",
+            public.algorithm().as_str(),
+            base64::engine::general_purpose::STANDARD.encode(key)
+        );
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(configuration)?;
+        io::Write::write_all(&mut file, line.as_bytes()).map_err(configuration)?;
+        file.sync_all().map_err(configuration)?;
+        self.entries
+            .push(Entry { hosts: Hosts::Exact(vec![lookup]), key: key.to_vec() });
+        Ok(())
+    }
+}
+
+fn lookup_name(host: &str, port: u16) -> String {
+    let host = host.to_ascii_lowercase();
+    if port == 22 { host } else { format!("[{host}]:{port}") }
+}
+
+fn untrusted(kind: Kind, fingerprint: String) -> Error {
+    Error::new(
+        kind,
+        format!(
+            "host key is not trusted; refusing authentication; presented {fingerprint}"
+        ),
+    )
 }
 
 fn configuration(detail: impl std::fmt::Display) -> Error {
@@ -177,6 +268,26 @@ mod tests {
             "{host} ssh-ed25519 {}\n",
             base64::engine::general_purpose::STANDARD.encode(key)
         )
+    }
+
+    struct TempDir(path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(prefix: &str) -> TempDir {
+        let root = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        TempDir(root)
     }
 
     #[test]
@@ -266,5 +377,108 @@ mod tests {
         assert!(Store::parse("# comment\n\n").is_ok());
         let text = line("host", &key(1)).replace("ssh-ed25519 ", "ssh-rsa ");
         assert!(Store::parse(&text).is_err());
+    }
+
+    #[test]
+    fn missing_known_hosts_is_unknown_not_a_configuration_fault() {
+        let missing = std::env::temp_dir().join(format!(
+            "sunset-missing-hosts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::load(&missing).unwrap();
+        assert_eq!(
+            store.verify("example.test", 22, &key(1)).unwrap_err().kind,
+            Kind::UnknownHostKey
+        );
+    }
+
+    #[test]
+    fn accept_new_records_unknown_keys_and_still_refuses_changed_keys() {
+        let root = temp_dir("sunset-accept-new");
+        let path = root.0.join("known_hosts");
+        let presented = key(3);
+        let mut store = Store::load(&path).unwrap();
+        assert!(
+            store
+                .verify_with(
+                    "example.test",
+                    22,
+                    &presented,
+                    StrictHostKeyChecking::AcceptNew,
+                    &path,
+                )
+                .is_ok()
+        );
+        let recorded = fs::read_to_string(&path).unwrap();
+        assert!(recorded.contains("example.test ssh-ed25519 "));
+        let mut store = Store::load(&path).unwrap();
+        assert!(store.verify("example.test", 22, &presented).is_ok());
+        assert_eq!(
+            store
+                .verify_with(
+                    "example.test",
+                    22,
+                    &key(4),
+                    StrictHostKeyChecking::AcceptNew,
+                    &path,
+                )
+                .unwrap_err()
+                .kind,
+            Kind::ChangedHostKey
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), recorded);
+    }
+
+    #[test]
+    fn ask_refuses_unknown_keys_without_writing() {
+        let root = temp_dir("sunset-ask-hosts");
+        let path = root.0.join("known_hosts");
+        let presented = key(7);
+        for checking in [StrictHostKeyChecking::Yes, StrictHostKeyChecking::Ask] {
+            let mut store = Store::load(&path).unwrap();
+            assert_eq!(
+                store
+                    .verify_with("example.test", 22, &presented, checking, &path)
+                    .unwrap_err()
+                    .kind,
+                Kind::UnknownHostKey
+            );
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn no_accepts_a_changed_key_without_rewriting_known_hosts() {
+        let presented = key(5);
+        let mut store = Store::parse(&line("example.test", &key(6))).unwrap();
+        let path = path::Path::new("/no-such-sunset-known-hosts");
+        assert!(
+            store
+                .verify_with(
+                    "example.test",
+                    22,
+                    &presented,
+                    StrictHostKeyChecking::No,
+                    path,
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .verify_with(
+                    "example.test",
+                    22,
+                    &presented,
+                    StrictHostKeyChecking::Yes,
+                    path,
+                )
+                .unwrap_err()
+                .kind,
+            Kind::ChangedHostKey
+        );
     }
 }

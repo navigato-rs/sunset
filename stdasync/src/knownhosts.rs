@@ -41,6 +41,29 @@ where
     }
 }
 
+/// OpenSSH `StrictHostKeyChecking`. `ask` is the interactive default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StrictHostKeyChecking {
+    Yes,
+    #[default]
+    Ask,
+    AcceptNew,
+    No,
+}
+
+impl StrictHostKeyChecking {
+    /// Parse an OpenSSH `StrictHostKeyChecking` value.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.to_ascii_lowercase().as_str() {
+            "yes" => Self::Yes,
+            "ask" => Self::Ask,
+            "accept-new" => Self::AcceptNew,
+            "no" | "off" => Self::No,
+            _ => return None,
+        })
+    }
+}
+
 const USER_KNOWN_HOSTS: &str = ".ssh/known_hosts";
 
 fn user_known_hosts() -> Result<PathBuf, KnownHostsError> {
@@ -56,9 +79,10 @@ pub fn check_known_hosts(
     host: &str,
     port: u16,
     key: &PubKey,
+    checking: StrictHostKeyChecking,
 ) -> Result<(), KnownHostsError> {
     let p = user_known_hosts()?;
-    check_known_hosts_file(host, port, key, &p)
+    check_known_hosts_file(host, port, key, &p, checking)
 }
 
 /// Returns a `(host, key)` entry from a known_hosts line, or `None` if not matching
@@ -80,58 +104,86 @@ pub fn check_known_hosts_file(
     port: u16,
     key: &PubKey,
     p: &Path,
+    checking: StrictHostKeyChecking,
 ) -> Result<(), KnownHostsError> {
-    let f = File::open(p)?;
-    let f = io::BufReader::new(f);
-
     let match_host = host_part(host, port);
 
     let pubk: OpenSSHKey = key.try_into()?;
 
-    for (line, (lh, lk)) in f.lines().enumerate().filter_map(|(num, l)| {
-        if let Ok(l) = l { line_entry(&l).map(|entry| (num, entry)) } else { None }
-    }) {
-        let line = line + 1;
+    match File::open(p) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+        Ok(f) => {
+            let f = io::BufReader::new(f);
+            for (line, (lh, lk)) in f.lines().enumerate().filter_map(|(num, l)| {
+                if let Ok(l) = l {
+                    line_entry(&l).map(|entry| (num, entry))
+                } else {
+                    None
+                }
+            }) {
+                let line = line + 1;
 
-        if lh != match_host {
-            continue;
-        }
+                if lh != match_host {
+                    continue;
+                }
 
-        let known_key = match OpenSSHKey::from_openssh(&lk) {
-            Ok(k) => k,
-            Err(e) => {
-                warn!(
-                    "Unparsed key for \"{}\" on line {}:{}",
-                    host,
-                    p.display(),
-                    line
-                );
-                trace!("{e:?}");
-                continue;
-            }
-        };
+                let known_key = match OpenSSHKey::from_openssh(&lk) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        warn!(
+                            "Unparsed key for \"{}\" on line {}:{}",
+                            host,
+                            p.display(),
+                            line
+                        );
+                        trace!("{e:?}");
+                        continue;
+                    }
+                };
 
-        if pubk.algorithm() != known_key.algorithm() {
-            debug!("Line {line}, Ignoring other-format existing key {known_key:?}")
-        } else if pubk.key_data() == known_key.key_data() {
-            debug!("Line {line}, found matching key");
-            return Ok(());
-        } else {
-            let fp = known_key.fingerprint(ssh_key::HashAlg::Sha256);
-            println!(
-                "\nHost key mismatch for {match_host} in ~/.ssh/known_hosts line {line}\n\
+                if pubk.algorithm() != known_key.algorithm() {
+                    debug!(
+                        "Line {line}, Ignoring other-format existing key {known_key:?}"
+                    )
+                } else if pubk.key_data() == known_key.key_data() {
+                    debug!("Line {line}, found matching key");
+                    return Ok(());
+                } else if checking == StrictHostKeyChecking::No {
+                    debug!(
+                        "Line {line}, StrictHostKeyChecking=no, accepting changed key"
+                    );
+                    return Ok(());
+                } else {
+                    let fp = known_key.fingerprint(ssh_key::HashAlg::Sha256);
+                    println!(
+                        "\nHost key mismatch for {match_host} in ~/.ssh/known_hosts line {line}\n\
                 Existing key has fingerprint {fp}\n"
-            );
-            return Err(KnownHostsError::Mismatch {
-                path: p.to_path_buf(),
-                line,
-                existing: Box::new(known_key),
-            });
+                    );
+                    return Err(KnownHostsError::Mismatch {
+                        path: p.to_path_buf(),
+                        line,
+                        existing: Box::new(known_key),
+                    });
+                }
+            }
         }
     }
 
-    // no match, maybe add it
-    ask_to_confirm(host, port, key, p)
+    match checking {
+        StrictHostKeyChecking::Yes => {
+            let fp = pubk.fingerprint(ssh_key::HashAlg::Sha256);
+            Err(KnownHostsError::Other {
+                msg: format!(
+                    "StrictHostKeyChecking=yes; host {match_host} is not in known_hosts\nFingerprint {fp}"
+                ),
+            })
+        }
+        StrictHostKeyChecking::Ask => ask_to_confirm(host, port, key, p),
+        StrictHostKeyChecking::AcceptNew | StrictHostKeyChecking::No => {
+            add_key(host, port, key, p)
+        }
+    }
 }
 
 fn read_tty_response() -> Result<String, std::io::Error> {
@@ -188,7 +240,7 @@ fn add_key(
 
     let entry = format!("{h} {k}\n");
 
-    let mut f = std::fs::OpenOptions::new().append(true).open(p)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p)?;
 
     f.write_all(entry.as_bytes())?;
 

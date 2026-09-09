@@ -4,6 +4,10 @@
 
 ### Added
 
+- The desktop SSH client (`sunset-client`) honours `StrictHostKeyChecking`
+  from OpenSSH config (`yes`/`ask`, `accept-new`, `no`/`off`) instead of
+  ignoring it. `ask` is batch-mode `yes`: this client never prompts.
+
 - `Runner::send_channel_eof()`, and `send_eof()` on the async channel
   types. Previously `SSH_MSG_CHANNEL_EOF` was only ever sent in reply to
   the peer's, so an application could not tell a remote command that its

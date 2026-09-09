@@ -84,6 +84,7 @@ async fn run(args: Args) -> Result<ExitCode> {
             CmdlineClient::new(args.username.as_ref().unwrap(), &args.host);
 
         app.port(args.port);
+        app.strict_host_key_checking(parse_host_key_checking(&args.option)?);
 
         if want_pty {
             app.pty();
@@ -248,11 +249,25 @@ fn parse_args(tz: UtcOffset) -> Result<Args> {
         args.username = Some(whoami::username()?);
     }
 
-    for o in args.option.iter() {
-        warn!("Ignoring -o {o}")
-    }
-
     Ok(args)
+}
+
+fn parse_host_key_checking(
+    options: &[String],
+) -> Result<sunset_stdasync::StrictHostKeyChecking> {
+    let mut checking = sunset_stdasync::StrictHostKeyChecking::Ask;
+    for o in options {
+        let (key, value) = o.split_once('=').unwrap_or((o.as_str(), ""));
+        if key.eq_ignore_ascii_case("stricthostkeychecking") {
+            checking = sunset_stdasync::StrictHostKeyChecking::parse(value)
+                .ok_or_else(|| {
+                    anyhow!("invalid StrictHostKeyChecking value {value}")
+                })?;
+        } else {
+            warn!("Ignoring -o {o}")
+        }
+    }
+    Ok(checking)
 }
 
 fn setup_log(args: &Args, tz: UtcOffset) -> Result<()> {
