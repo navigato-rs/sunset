@@ -212,17 +212,19 @@ impl SigType {
     ) -> Result<()> {
         use rsa::traits::PublicKeyParts as _;
         // RFC 4253: rsa_signature_blob is the integer s with no padding.
-        // The rsa crate requires the signature's precision to match the modulus.
-        let n = k.key.size();
-        if n > packets::RSAPubKey::MAX_BITS as usize / 8 {
+        // rsa 0.10 requires signature.bits_precision() == n.bits_precision().
+        // SSH-decoded moduli are stored at RSAPubKey::MAX_BITS, so a 4096-bit
+        // host key's n is 8192-bit precision and a 512-byte blob is 4096.
+        let nbytes = (k.key.n_bits_precision() as usize).div_ceil(8);
+        if nbytes > packets::RSAPubKey::MAX_BITS as usize / 8 {
             return Err(Error::BadSig);
         }
         let mut padded = [0u8; packets::RSAPubKey::MAX_BITS as usize / 8];
-        copy_right_aligned(s.sig.0, &mut padded[..n]).map_err(|_| {
+        copy_right_aligned(s.sig.0, &mut padded[..nbytes]).map_err(|_| {
             trace!("RSA signature longer than modulus");
             Error::BadSig
         })?;
-        let signature = padded[..n].try_into().map_err(|e| {
+        let signature = padded[..nbytes].try_into().map_err(|e| {
             trace!("RSA bad signature: {e}");
             Error::BadSig
         })?;
@@ -798,5 +800,12 @@ pub mod tests {
         let ssh_sig_full =
             Signature::RSA(packets::RSASig { sig: BinString(sig.as_ref()) });
         SigType::RSA.verify(&pk, &msg, &ssh_sig_full).unwrap();
+
+        // SSHDecode stores n at MAX_BITS precision. A 1024-bit generated key
+        // round-tripped through the wire must still verify.
+        let mut blob = vec![];
+        ssh_push_vec(&mut blob, &pk).unwrap();
+        let (decoded, _) = read_ssh(&blob, None).unwrap();
+        SigType::RSA.verify(&decoded, &msg, &ssh_sig_full).unwrap();
     }
 }
