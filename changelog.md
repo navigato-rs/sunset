@@ -20,6 +20,13 @@
   ending the session. Output produced after the input ended, which was
   previously lost, now arrives.
 
+- RSA host-key verification accepts OpenSSH's unpadded signature blob.
+  The rsa crate requires the signature's precision to match the modulus;
+  a short wire integer produced `Signature is incorrect`.
+
+- Hostkey and userauth signatures understand `rsa-sha2-512` as well as
+  `rsa-sha2-256`. OpenSSH prefers 512, and some servers offer only that.
+
 ## 0.6.0 - 2026-08-02
 
 ### Changed

@@ -566,6 +566,10 @@ pub enum Signature<'a> {
     #[sshwire(variant = SSH_NAME_RSA_SHA256)]
     RSA(RSASig<'a>),
 
+    #[cfg(feature = "rsa")]
+    #[sshwire(variant = SSH_NAME_RSA_SHA512)]
+    RsaSha512(RSASig<'a>),
+
     #[cfg(feature = "ecdsa256")]
     #[sshwire(variant = SSH_NAME_ECDSA256)]
     ECDSA256(Blob<ECDSASig<'a>>),
@@ -584,6 +588,8 @@ impl<'a> Signature<'a> {
             Signature::Ed25519(_) => Ok(SSH_NAME_ED25519),
             #[cfg(feature = "rsa")]
             Signature::RSA(_) => Ok(SSH_NAME_RSA_SHA256),
+            #[cfg(feature = "rsa")]
+            Signature::RsaSha512(_) => Ok(SSH_NAME_RSA_SHA512),
             #[cfg(feature = "ecdsa256")]
             Signature::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
             Signature::SkEd25519(_) => Ok(SSH_NAME_SK_ED25519),
@@ -617,6 +623,8 @@ impl<'a> Signature<'a> {
             Signature::Ed25519(_) => Ok(SigType::Ed25519),
             #[cfg(feature = "rsa")]
             Signature::RSA(_) => Ok(SigType::RSA),
+            #[cfg(feature = "rsa")]
+            Signature::RsaSha512(_) => Ok(SigType::RsaSha512),
             #[cfg(feature = "ecdsa256")]
             Signature::ECDSA256(_) => Ok(SigType::ECDSA256),
             Signature::SkEd25519(_) => Ok(SigType::SkEd25519),

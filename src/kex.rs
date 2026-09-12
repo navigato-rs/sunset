@@ -58,6 +58,8 @@ const marker_only_kexs: &[&str] = &[
 const fixed_options_hostsig: &[&str] = &[
     SSH_NAME_ED25519,
     #[cfg(feature = "rsa")]
+    SSH_NAME_RSA_SHA512,
+    #[cfg(feature = "rsa")]
     SSH_NAME_RSA_SHA256,
 ];
 
@@ -707,7 +709,9 @@ impl Kex<Server> {
     pub fn send_ext_info(&self, s: &mut TrafSend) -> Result<()> {
         if cfg!(feature = "rsa") {
             // OK unwrap: namelist has capacity
-            let algs = ([SSH_NAME_RSA_SHA256, SSH_NAME_ED25519].as_slice())
+            let algs =
+                ([SSH_NAME_RSA_SHA512, SSH_NAME_RSA_SHA256, SSH_NAME_ED25519]
+                    .as_slice())
                 .try_into()
                 .unwrap();
             let ext =
