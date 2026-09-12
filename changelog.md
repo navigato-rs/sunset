@@ -20,9 +20,10 @@
   ending the session. Output produced after the input ended, which was
   previously lost, now arrives.
 
-- RSA host-key verification accepts OpenSSH's unpadded signature blob.
-  The rsa crate requires the signature's precision to match the modulus;
-  a short wire integer produced `Signature is incorrect`.
+- RSA host-key verification matches rsa 0.10's `bits_precision` check.
+  SSH-decoded moduli are stored at 8192-bit precision while OpenSSH's
+  signature blob is the key size (often 4096 bits); that mismatch
+  produced `Signature is incorrect` against RSA host keys.
 
 - Hostkey and userauth signatures understand `rsa-sha2-512` as well as
   `rsa-sha2-256`. OpenSSH prefers 512, and some servers offer only that.
