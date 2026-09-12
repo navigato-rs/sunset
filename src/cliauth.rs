@@ -278,7 +278,8 @@ impl CliAuth {
             // we only worry about rsa-sha256, assuming other older key types are fine
 
             // OK unwrap: is a remote namelist
-            self.allow_rsa_sha2 = algs.has_algo(SSH_NAME_RSA_SHA256).unwrap();
+            self.allow_rsa_sha2 = algs.has_algo(SSH_NAME_RSA_SHA256).unwrap()
+                || algs.has_algo(SSH_NAME_RSA_SHA512).unwrap();
             trace!("setting allow_rsa_sha2 = {}", self.allow_rsa_sha2);
         }
     }
