@@ -62,6 +62,8 @@ pub enum SigType {
     SkEd25519,
     #[cfg(feature = "rsa")]
     RSA,
+    #[cfg(feature = "rsa")]
+    RsaSha512,
     #[cfg(feature = "ecdsa256")]
     ECDSA256,
 }
@@ -81,6 +83,8 @@ impl SigType {
             SSH_NAME_SK_ED25519 => Ok(SigType::SkEd25519),
             #[cfg(feature = "rsa")]
             SSH_NAME_RSA_SHA256 => Ok(SigType::RSA),
+            #[cfg(feature = "rsa")]
+            SSH_NAME_RSA_SHA512 => Ok(SigType::RsaSha512),
             #[cfg(feature = "ecdsa256")]
             SSH_NAME_ECDSA256 => Ok(SigType::ECDSA256),
             _ => Error::bug(),
@@ -94,6 +98,8 @@ impl SigType {
             SigType::SkEd25519 => SSH_NAME_SK_ED25519,
             #[cfg(feature = "rsa")]
             SigType::RSA => SSH_NAME_RSA_SHA256,
+            #[cfg(feature = "rsa")]
+            SigType::RsaSha512 => SSH_NAME_RSA_SHA512,
             #[cfg(feature = "ecdsa256")]
             SigType::ECDSA256 => SSH_NAME_ECDSA256,
         }
@@ -105,7 +111,7 @@ impl SigType {
             Signature::Ed25519(e) => e.sig.0,
             Signature::SkEd25519(e) => e.sig.0,
             #[cfg(feature = "rsa")]
-            Signature::RSA(e) => e.sig.0,
+            Signature::RSA(e) | Signature::RsaSha512(e) => e.sig.0,
             Signature::Unknown(_) => panic!(),
         };
 
@@ -141,7 +147,11 @@ impl SigType {
 
             #[cfg(feature = "rsa")]
             (SigType::RSA, PubKey::RSA(k), Signature::RSA(s)) => {
-                Self::verify_rsa(k, msg, s)
+                Self::verify_rsa(k, msg, s, false)
+            }
+            #[cfg(feature = "rsa")]
+            (SigType::RsaSha512, PubKey::RSA(k), Signature::RsaSha512(s)) => {
+                Self::verify_rsa(k, msg, s, true)
             }
 
             #[cfg(feature = "ecdsa256")]
@@ -198,26 +208,49 @@ impl SigType {
         k: &packets::RSAPubKey,
         msg: &dyn SSHEncode,
         s: &packets::RSASig,
+        sha512: bool,
     ) -> Result<()> {
-        let verifying_key =
-            rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(k.key.clone());
-        let signature = s.sig.0.try_into().map_err(|e| {
+        use rsa::traits::PublicKeyParts as _;
+        // RFC 4253: rsa_signature_blob is the integer s with no padding.
+        // The rsa crate requires the signature's precision to match the modulus.
+        let n = k.key.size();
+        if n > packets::RSAPubKey::MAX_BITS as usize / 8 {
+            return Err(Error::BadSig);
+        }
+        let mut padded = [0u8; packets::RSAPubKey::MAX_BITS as usize / 8];
+        copy_right_aligned(s.sig.0, &mut padded[..n]).map_err(|_| {
+            trace!("RSA signature longer than modulus");
+            Error::BadSig
+        })?;
+        let signature = padded[..n].try_into().map_err(|e| {
             trace!("RSA bad signature: {e}");
             Error::BadSig
         })?;
-
-        verifying_key
-            .verify_digest(
-                |h| {
-                    sshwire::hash_ser(h, msg)
-                        .map_err(|_| rsa::signature::Error::new())
-                },
-                &signature,
-            )
-            .map_err(|e| {
-                trace!("RSA verify failed: {e}");
-                Error::BadSig
-            })
+        let fail = |e| {
+            trace!("RSA verify failed: {e}");
+            Error::BadSig
+        };
+        if sha512 {
+            rsa::pkcs1v15::VerifyingKey::<sha2::Sha512>::new(k.key.clone())
+                .verify_digest(
+                    |h| {
+                        sshwire::hash_ser(h, msg)
+                            .map_err(|_| rsa::signature::Error::new())
+                    },
+                    &signature,
+                )
+                .map_err(fail)
+        } else {
+            rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(k.key.clone())
+                .verify_digest(
+                    |h| {
+                        sshwire::hash_ser(h, msg)
+                            .map_err(|_| rsa::signature::Error::new())
+                    },
+                    &signature,
+                )
+                .map_err(fail)
+        }
     }
 
     #[cfg(feature = "_ecdsa")]
@@ -306,7 +339,9 @@ impl TryFrom<Signature<'_>> for OwnedSig {
                 Ok(OwnedSig::SkEd25519 { sig, flags: s.flags, counter: s.counter })
             }
             #[cfg(feature = "rsa")]
-            Signature::RSA(s) => Ok(OwnedSig::RSA(s.sig.0.into())),
+            Signature::RSA(s) | Signature::RsaSha512(s) => {
+                Ok(OwnedSig::RSA(s.sig.0.into()))
+            }
             #[cfg(feature = "ecdsa256")]
             Signature::ECDSA256(sig) => {
                 let sig = sig.0;
@@ -493,7 +528,7 @@ impl SignKey {
 
             #[cfg(feature = "rsa")]
             SignKey::RSA(_) | SignKey::AgentRSA(_) => {
-                matches!(sig_type, SigType::RSA)
+                matches!(sig_type, SigType::RSA | SigType::RsaSha512)
             }
             #[cfg(feature = "ecdsa256")]
             SignKey::ECDSA256(_) | SignKey::AgentECDSA256(_) => {
@@ -745,5 +780,23 @@ pub mod tests {
                 assert_eq!(k, dk);
             }
         }
+    }
+
+    #[cfg(feature = "rsa")]
+    #[test]
+    fn rsa_verify_unpadded_openssh_blob() {
+        let k = SignKey::generate(KeyType::RSA, Some(1024)).unwrap();
+        let msg = [0x5au8; 32];
+        let OwnedSig::RSA(sig) = k.sign(&msg).unwrap() else {
+            panic!("expected RSA signature");
+        };
+        let stripped: Vec<u8> =
+            sig.iter().copied().skip_while(|&b| b == 0).collect();
+        let pk = k.pubkey();
+        let ssh_sig = Signature::RSA(packets::RSASig { sig: BinString(&stripped) });
+        SigType::RSA.verify(&pk, &msg, &ssh_sig).unwrap();
+        let ssh_sig_full =
+            Signature::RSA(packets::RSASig { sig: BinString(sig.as_ref()) });
+        SigType::RSA.verify(&pk, &msg, &ssh_sig_full).unwrap();
     }
 }

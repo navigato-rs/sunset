@@ -32,6 +32,8 @@ pub const SSH_NAME_ED25519: &str = "ssh-ed25519";
 pub const SSH_NAME_SK_ED25519: &str = "sk-ssh-ed25519@openssh.com";
 /// [RFC8332](https://tools.ietf.org/html/rfc8332)
 pub const SSH_NAME_RSA_SHA256: &str = "rsa-sha2-256";
+/// [RFC8332](https://tools.ietf.org/html/rfc8332)
+pub const SSH_NAME_RSA_SHA512: &str = "rsa-sha2-512";
 /// [RFC4253](https://tools.ietf.org/html/rfc4253). Deprecated for signatures but is a valid key type.
 pub const SSH_NAME_RSA: &str = "ssh-rsa";
 /// [RFC5656](https://tools.ietf.org/html/rfc5656).
