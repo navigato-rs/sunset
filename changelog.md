@@ -16,6 +16,13 @@
 
 ### Fixed
 
+- `sunset-client` skips security-key (`sk-ssh-ed25519` / `sk-ecdsa-*`)
+  identity files instead of offering them as signable files. RustCrypto
+  cannot sign those handles (the authenticator holds the private half),
+  so that path failed later with an opaque `signature error`. Add the
+  key with `ssh-add` so the agent can sign; `IdentitiesOnly` still
+  allows the matching agent identity via the file's public half.
+
 - `sunsetc` sends channel EOF when its own input ends, rather than
   ending the session. Output produced after the input ended, which was
   previously lost, now arrives.

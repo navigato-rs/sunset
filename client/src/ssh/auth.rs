@@ -2,7 +2,8 @@
 //! Identity files are offered first; IdentitiesOnly restricts agent identities
 //! to configured public keys. RustCrypto signs files; the agent signs
 //! its own keys, including `sk-ssh-ed25519` (the authenticator holds the
-//! private half). `sk-ecdsa-*` is still skipped.
+//! private half). Security-key identity files are skipped so they are not
+//! offered as signable files. `sk-ecdsa-*` is still skipped.
 
 use std::{collections, fs, io, path, time};
 
@@ -189,6 +190,19 @@ fn load_file(path: &path::Path) -> Result<PreparedKey, String> {
             "{display}: encrypted; add it with ssh-add so the agent can sign"
         ));
     }
+    // A security-key (sk) identity file holds only a credential handle; the
+    // private half lives in the authenticator, so RustCrypto cannot sign it
+    // (that path fails late with an opaque "signature error"). Only the agent,
+    // which drives the authenticator, can. Skip the file so the agent offers
+    // the same key; with IdentitiesOnly its public half is still in `allowed`.
+    if matches!(
+        private.algorithm(),
+        ssh_key::Algorithm::SkEd25519 | ssh_key::Algorithm::SkEcdsaSha2NistP256
+    ) {
+        return Err(format!(
+            "{display}: security-key (sk) identity; add it with ssh-add so the agent can sign"
+        ));
+    }
     let wire = private
         .public_key()
         .to_bytes()
@@ -306,5 +320,75 @@ mod tests {
         assert!(!permitted(&key, &[]));
         assert!(!permitted(&key, &[vec![0; wire.len()]]));
         assert!(permitted(&key, &[wire]));
+    }
+
+    struct TempFile(path::PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn sk_ed25519_file() -> TempFile {
+        let public = ssh_key::public::SkEd25519::new(
+            ssh_key::public::Ed25519PublicKey([0x11; 32]),
+            "ssh:",
+        );
+        let sk = ssh_key::private::SkEd25519::new(public, 0x01, vec![0x22; 32])
+            .expect("key handle fits");
+        let pem = ssh_key::PrivateKey::from(sk)
+            .to_openssh(ssh_key::LineEnding::LF)
+            .expect("encode sk private key");
+        let path = std::env::temp_dir().join(format!(
+            "sunset-sk-{}-{}.key",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, pem.as_bytes()).unwrap();
+        TempFile(path)
+    }
+
+    #[test]
+    fn load_file_skips_sk_ed25519_identity() {
+        let file = sk_ed25519_file();
+        let err = match load_file(&file.0) {
+            Ok(_) => panic!("sk identity file was offered as a signable file"),
+            Err(err) => err,
+        };
+        assert!(err.contains("security-key (sk) identity"), "{err}");
+        assert!(err.contains("ssh-add"), "{err}");
+    }
+
+    #[test]
+    fn public_identity_still_reads_an_sk_file() {
+        let file = sk_ed25519_file();
+        let wire = public_identity(&file.0).expect("sk public half");
+        assert!(!wire.is_empty());
+    }
+
+    #[test]
+    fn sk_file_without_agent_names_the_skip_instead_of_signing() {
+        let file = sk_ed25519_file();
+        let error = match Credentials::load(
+            &crate::Authentication {
+                files: vec![file.0.clone()],
+                agent: false,
+                identities_only: true,
+            },
+            time::Instant::now() + time::Duration::from_secs(1),
+        ) {
+            Ok(_) => panic!("sk identity file was offered without an agent"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, crate::Kind::Authentication);
+        assert!(
+            error.detail().contains("security-key (sk) identity"),
+            "{}",
+            error.detail()
+        );
+        assert!(!error.detail().contains("signature error"), "{}", error.detail());
     }
 }
