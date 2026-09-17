@@ -257,6 +257,14 @@ pub struct Connection {
     stdout: collections::VecDeque<u8>,
     stderr: collections::VecDeque<u8>,
     closed: bool,
+    exit: Option<ChannelExit>,
+}
+
+/// How a remote command finished, when the server said.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChannelExit {
+    Status(u32),
+    Signal(String),
 }
 
 impl Connection {
@@ -353,6 +361,7 @@ impl Connection {
             stdout: collections::VecDeque::new(),
             stderr: collections::VecDeque::new(),
             closed: false,
+            exit: None,
         };
         while !connection.authenticated {
             remaining(deadline)?;
@@ -632,8 +641,15 @@ impl Connection {
                             // ends the channel).
                             self.started = true;
                         }
-                        sunset::CliEvent::SessionExit(_)
-                        | sunset::CliEvent::Banner(_) => {}
+                        sunset::CliEvent::SessionExit(e) => {
+                            self.exit = Some(match e.exit {
+                                sunset::SessionExit::Status(c) => ChannelExit::Status(c),
+                                sunset::SessionExit::Signal(ref s) => {
+                                    ChannelExit::Signal(s.signal.to_string())
+                                }
+                            });
+                        }
+                        sunset::CliEvent::Banner(_) => {}
                         sunset::CliEvent::Defunct => self.closed = true,
                         sunset::CliEvent::PollAgain => {}
                     }
@@ -903,6 +919,24 @@ impl Channel {
     pub fn abort(&mut self) {
         self.connection.closed = true;
         let _ = self.connection.transport.socket().shutdown(net::Shutdown::Both);
+    }
+
+    /// Signal end of stdin. Commands that read to EOF (`tar xf -`) wait for this.
+    pub fn send_eof(&mut self) -> Result<(), Error> {
+        let Some(handle) = self.connection.handle.as_ref() else {
+            return Ok(());
+        };
+        self.connection
+            .runner
+            .send_channel_eof(handle)
+            .map_err(protocol)?;
+        self.connection.flush_socket()?;
+        Ok(())
+    }
+
+    /// Exit status or signal, once the server has sent one.
+    pub fn exit(&self) -> Option<&ChannelExit> {
+        self.connection.exit.as_ref()
     }
     fn write_buffered(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.connection.channel_eof() {
