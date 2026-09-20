@@ -73,25 +73,6 @@ impl StrictHostKeyChecking {
     }
 }
 
-/// OpenSSH `UserKnownHostsFile none` / `/dev/null` / `NUL`: do not persist keys.
-pub(crate) fn discards_known_hosts(path: &path::Path) -> bool {
-    let name = path.as_os_str();
-    name == "/dev/null"
-        || name.eq_ignore_ascii_case("nul")
-        || name.eq_ignore_ascii_case(r"\\.\NUL")
-}
-
-pub(crate) fn null_known_hosts() -> path::PathBuf {
-    #[cfg(windows)]
-    {
-        path::PathBuf::from("NUL")
-    }
-    #[cfg(not(windows))]
-    {
-        path::PathBuf::from("/dev/null")
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Options {
     pub host: String,
@@ -153,12 +134,6 @@ impl Options {
             return Err(Error::new(
                 Kind::Configuration,
                 "SSH timeout must be between 1 ms and 300 s",
-            ));
-        }
-        if self.known_hosts.as_os_str().is_empty() {
-            return Err(Error::new(
-                Kind::Configuration,
-                "an explicit known-hosts file is required",
             ));
         }
         if let Some(ref alias) = self.host_key_alias

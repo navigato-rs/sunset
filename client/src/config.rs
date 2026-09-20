@@ -3,10 +3,7 @@
 
 use std::{collections, fs, io, path, time};
 
-use crate::{
-    Authentication, MAX_JUMPS, Options, StrictHostKeyChecking, discards_known_hosts,
-    null_known_hosts,
-};
+use crate::{Authentication, MAX_JUMPS, Options, StrictHostKeyChecking};
 
 use anyhow::Context;
 
@@ -174,11 +171,8 @@ impl Config {
                 profile
                     .unsupported
                     .push("multiple UserKnownHostsFile".into());
-            } else if value.eq_ignore_ascii_case("none")
-                || discards_known_hosts(path::Path::new(value))
-            {
-                // OpenSSH `none` / `/dev/null` / `NUL`: no file to persist to.
-                profile.known_hosts = Some(null_known_hosts());
+            } else if value.eq_ignore_ascii_case("none") {
+                profile.known_hosts = Some(path::PathBuf::new());
             } else {
                 profile.known_hosts =
                     Some(expand_path(value, &self.home, alias, &profile)?);
@@ -867,20 +861,12 @@ mod tests {
     }
 
     #[test]
-    fn userknownhostsfile_none_and_null_are_not_blockers() {
-        for text in [
-            "Host dev\nUserKnownHostsFile none",
-            "Host dev\nUserKnownHostsFile /dev/null",
-            "Host dev\nUserKnownHostsFile NUL",
-        ] {
-            let profile = config(text).resolve("dev").unwrap();
-            assert!(
-                profile.unsupported.is_empty(),
-                "{text:?} should not be blocked: {:?}",
-                profile.unsupported
-            );
-            assert_eq!(profile.known_hosts.unwrap(), crate::null_known_hosts());
-        }
+    fn userknownhostsfile_none_is_not_a_blocker() {
+        let profile = config("Host dev\nUserKnownHostsFile none")
+            .resolve("dev")
+            .unwrap();
+        assert!(profile.unsupported.is_empty());
+        assert_eq!(profile.known_hosts.as_deref(), Some(path::Path::new("")));
     }
 
     #[test]

@@ -14,9 +14,11 @@ policy fails closed. OS DNS and local file access can still block.
 
 `StrictHostKeyChecking` is honoured (`yes`/`ask` refuse unknown keys,
 `accept-new` appends them, `no`/`off` also accepts a changed key). This
-client never prompts, so `ask` matches `yes`. `HashKnownHosts yes` is a
-blocker when a key would be recorded, because hashed writes are not
-implemented.
+client never prompts, so `ask` matches `yes`. Recording a new key is
+best-effort: a path that cannot be updated (`/dev/null`, a read-only
+file, `UserKnownHostsFile none`) still accepts the key for the session.
+`HashKnownHosts yes` is a blocker when a key would be recorded, because
+hashed writes are not implemented.
 
 The client started from Starcom's SSH implementation at
 `d3135b22d4c597b6f0c848fee304b1f8faa3020e` and retains its MIT license.
