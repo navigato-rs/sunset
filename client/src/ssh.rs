@@ -73,6 +73,25 @@ impl StrictHostKeyChecking {
     }
 }
 
+/// OpenSSH `UserKnownHostsFile none` / `/dev/null` / `NUL`: do not persist keys.
+pub(crate) fn discards_known_hosts(path: &path::Path) -> bool {
+    let name = path.as_os_str();
+    name == "/dev/null"
+        || name.eq_ignore_ascii_case("nul")
+        || name.eq_ignore_ascii_case(r"\\.\NUL")
+}
+
+pub(crate) fn null_known_hosts() -> path::PathBuf {
+    #[cfg(windows)]
+    {
+        path::PathBuf::from("NUL")
+    }
+    #[cfg(not(windows))]
+    {
+        path::PathBuf::from("/dev/null")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub host: String,
