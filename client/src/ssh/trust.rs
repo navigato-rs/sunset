@@ -214,9 +214,14 @@ impl Store {
         port: u16,
         key: &[u8],
     ) -> Result<(), Error> {
+        let lookup = lookup_name(host, port);
+        if super::discards_known_hosts(path) {
+            self.entries
+                .push(Entry { hosts: Hosts::Exact(vec![lookup]), key: key.to_vec() });
+            return Ok(());
+        }
         let public = ssh_key::PublicKey::from_bytes(key)
             .map_err(|_| Error::new(Kind::Transport, "invalid server public key"))?;
-        let lookup = lookup_name(host, port);
         let line = format!(
             "{lookup} {} {}\n",
             public.algorithm().as_str(),
@@ -479,6 +484,36 @@ mod tests {
                 .unwrap_err()
                 .kind,
             Kind::ChangedHostKey
+        );
+    }
+
+    #[test]
+    fn discard_paths_accept_unknown_keys_without_writing() {
+        let path = super::super::null_known_hosts();
+        let presented = key(9);
+        let mut store = Store::load(&path).unwrap();
+        assert!(
+            store
+                .verify_with(
+                    "example.test",
+                    22,
+                    &presented,
+                    StrictHostKeyChecking::AcceptNew,
+                    &path,
+                )
+                .is_ok()
+        );
+        assert!(store.verify("example.test", 22, &presented).is_ok());
+        assert!(
+            store
+                .verify_with(
+                    "other.test",
+                    22,
+                    &key(10),
+                    StrictHostKeyChecking::No,
+                    &path,
+                )
+                .is_ok()
         );
     }
 }
