@@ -34,22 +34,29 @@ enum Status {
 
 impl Store {
     pub fn load(path: &path::Path) -> Result<Self, Error> {
+        if path.as_os_str().is_empty() {
+            return Ok(Self { entries: Vec::new() });
+        }
         let file = match fs::File::open(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self { entries: Vec::new() });
-            }
-            other => other.map_err(configuration)?,
+            Ok(file) => file,
+            Err(_) => return Ok(Self { entries: Vec::new() }),
         };
         let mut data = Vec::new();
-        io::Read::read_to_end(
+        if io::Read::read_to_end(
             &mut io::Read::take(file, MAX_FILE_BYTES + 1),
             &mut data,
         )
-        .map_err(configuration)?;
+        .is_err()
+        {
+            return Ok(Self { entries: Vec::new() });
+        }
         if data.len() as u64 > MAX_FILE_BYTES {
             return Err(configuration("known-hosts file exceeds 4 MiB"));
         }
-        Self::parse(std::str::from_utf8(&data).map_err(configuration)?)
+        let Ok(text) = std::str::from_utf8(&data) else {
+            return Err(configuration("known-hosts file is not UTF-8"));
+        };
+        Self::parse(text)
     }
 
     fn parse(text: &str) -> Result<Self, Error> {
@@ -214,26 +221,27 @@ impl Store {
         port: u16,
         key: &[u8],
     ) -> Result<(), Error> {
-        let lookup = lookup_name(host, port);
-        if super::discards_known_hosts(path) {
-            self.entries
-                .push(Entry { hosts: Hosts::Exact(vec![lookup]), key: key.to_vec() });
-            return Ok(());
-        }
         let public = ssh_key::PublicKey::from_bytes(key)
             .map_err(|_| Error::new(Kind::Transport, "invalid server public key"))?;
-        let line = format!(
-            "{lookup} {} {}\n",
-            public.algorithm().as_str(),
-            base64::engine::general_purpose::STANDARD.encode(key)
-        );
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(configuration)?;
-        io::Write::write_all(&mut file, line.as_bytes()).map_err(configuration)?;
-        file.sync_all().map_err(configuration)?;
+        let lookup = lookup_name(host, port);
+        if !path.as_os_str().is_empty() {
+            let line = format!(
+                "{lookup} {} {}\n",
+                public.algorithm().as_str(),
+                base64::engine::general_purpose::STANDARD.encode(key)
+            );
+            // Best-effort: /dev/null, a read-only path, or a full disk must not
+            // abort a connection whose policy already accepted this key.
+            let _ = (|| -> io::Result<()> {
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                io::Write::write_all(&mut file, line.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            })();
+        }
         self.entries
             .push(Entry { hosts: Hosts::Exact(vec![lookup]), key: key.to_vec() });
         Ok(())
@@ -488,10 +496,11 @@ mod tests {
     }
 
     #[test]
-    fn discard_paths_accept_unknown_keys_without_writing() {
-        let path = super::super::null_known_hosts();
+    fn an_unusable_known_hosts_path_still_accepts_unknown_keys() {
         let presented = key(9);
-        let mut store = Store::load(&path).unwrap();
+        // A directory cannot be appended to; recording must not abort TOFU.
+        let root = temp_dir("sunset-unusable-hosts");
+        let mut store = Store::load(&root.0).unwrap();
         assert!(
             store
                 .verify_with(
@@ -499,21 +508,21 @@ mod tests {
                     22,
                     &presented,
                     StrictHostKeyChecking::AcceptNew,
-                    &path,
+                    &root.0,
                 )
                 .is_ok()
         );
         assert!(store.verify("example.test", 22, &presented).is_ok());
+        let mut none = Store::load(path::Path::new("")).unwrap();
         assert!(
-            store
-                .verify_with(
-                    "other.test",
-                    22,
-                    &key(10),
-                    StrictHostKeyChecking::No,
-                    &path,
-                )
-                .is_ok()
+            none.verify_with(
+                "other.test",
+                22,
+                &key(10),
+                StrictHostKeyChecking::No,
+                path::Path::new(""),
+            )
+            .is_ok()
         );
     }
 }
