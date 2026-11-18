@@ -59,15 +59,54 @@ fn first_proxy_directive_wins_even_when_disabled() {
 }
 
 #[test]
-fn hop_policy_and_nested_routes_fail_before_connecting() {
-    for body in ["ProxyCommand forbidden", "ProxyJump other", "IdentityAgent custom"]
-    {
+fn hop_policy_fails_before_connecting() {
+    for body in ["ProxyCommand forbidden", "IdentityAgent custom"] {
         let config =
             parse(&format!("Host dest\nProxyJump relay\nHost relay\n{body}\n"));
         assert!(
             config.connection("dest", "test", time::Duration::from_secs(1)).is_err()
         );
     }
+}
+
+#[test]
+fn nested_proxyjump_is_placed_in_front_of_the_hop() {
+    let config = parse(
+        "Host dest\nHostName dest.example\nUser dest\nProxyJump jumpuser@middle:2022,tail\nHost middle\nHostName middle.internal\nUser ignored\nProxyJump outer\nHost outer\nHostName gw.example\nUser jump\nHost tail\nHostName tail.example\nUser tail\nProxyJump none\n",
+    );
+    let options =
+        config.connection("dest", "fallback", time::Duration::from_secs(5)).unwrap();
+    assert_eq!(options.host, "dest.example");
+    let hops: Vec<_> = options
+        .jumps
+        .iter()
+        .map(|hop| (hop.host.as_str(), hop.user.as_str(), hop.port))
+        .collect();
+    assert_eq!(
+        hops,
+        [
+            ("gw.example", "jump", 22),
+            ("middle.internal", "jumpuser", 2022),
+            ("tail.example", "tail", 22),
+        ]
+    );
+    assert!(options.jumps.iter().all(|hop| hop.jumps.is_empty()));
+}
+
+#[test]
+fn proxyjump_cycles_and_overlong_chains_fail_before_connecting() {
+    let cycle =
+        parse("Host dest\nProxyJump a\nHost a\nProxyJump b\nHost b\nProxyJump a\n");
+    let error =
+        cycle.connection("dest", "test", time::Duration::from_secs(1)).unwrap_err();
+    assert!(error.to_string().contains("cycle"), "{error}");
+
+    let long = parse(
+        "Host dest\nProxyJump a\nHost a\nProxyJump b\nHost b\nProxyJump c\nHost c\nProxyJump d\nHost d\nProxyJump e\n",
+    );
+    let error =
+        long.connection("dest", "test", time::Duration::from_secs(1)).unwrap_err();
+    assert!(error.to_string().contains("four"), "{error}");
 }
 
 #[test]

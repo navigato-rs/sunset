@@ -26,8 +26,9 @@ The rest of Sunset retains its existing license.
 
 `config::Config::connection(alias, user, timeout)` resolves up to four ordered
 ProxyJump bastions. Each has its own host, user, port, identity and trust policy.
-Nested routes, ProxyCommand and URI-shaped jump destinations are rejected;
-there is no direct-connection fallback. Reconnect by rebuilding the same route.
+A hop's own ProxyJump is placed in front of that hop. Cycles and chains longer
+than four hops are rejected. ProxyCommand and URI-shaped jump destinations are
+rejected; there is no direct-connection fallback. Reconnect by rebuilding the same route.
 Only the first hop is resolved locally. The protocol pump bounds work at each
 hop and shares the root socket's readiness poller and cancellation wake.
 
