@@ -233,10 +233,8 @@ impl Store {
             // Best-effort: /dev/null, a read-only path, or a full disk must not
             // abort a connection whose policy already accepted this key.
             let _ = (|| -> io::Result<()> {
-                let mut file = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?;
+                let mut file =
+                    fs::OpenOptions::new().create(true).append(true).open(path)?;
                 io::Write::write_all(&mut file, line.as_bytes())?;
                 file.sync_all()?;
                 Ok(())

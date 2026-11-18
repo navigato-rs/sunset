@@ -168,9 +168,7 @@ impl Config {
         }
         if let Some(value) = first("userknownhostsfile") {
             if values["userknownhostsfile"].len() != 1 {
-                profile
-                    .unsupported
-                    .push("multiple UserKnownHostsFile".into());
+                profile.unsupported.push("multiple UserKnownHostsFile".into());
             } else if value.eq_ignore_ascii_case("none") {
                 profile.known_hosts = Some(path::PathBuf::new());
             } else {
@@ -263,22 +261,52 @@ impl Config {
     ) -> anyhow::Result<Options> {
         let profile = self.resolve_with(alias, None, None, Some(fallback_user))?;
         let mut options = self.endpoint(alias, &profile, timeout)?;
-        for jump in &profile.jumps {
+        let mut stack = Vec::new();
+        self.expand_jumps(
+            &profile.jumps,
+            fallback_user,
+            timeout,
+            &mut stack,
+            &mut options.jumps,
+        )?;
+        options.validate()?;
+        Ok(options)
+    }
+
+    /// Splice each hop's own `ProxyJump` in front of that hop. The runtime
+    /// still sees one ordered chain: outermost bastion first.
+    fn expand_jumps(
+        &self,
+        jumps: &[Jump],
+        fallback_user: &str,
+        timeout: time::Duration,
+        stack: &mut Vec<String>,
+        out: &mut Vec<Options>,
+    ) -> anyhow::Result<()> {
+        for jump in jumps {
+            anyhow::ensure!(
+                !stack.iter().any(|name| name == &jump.alias),
+                "ProxyJump cycle through {}",
+                jump.alias
+            );
             let hop = self.resolve_with(
                 &jump.alias,
                 jump.user.as_deref(),
                 jump.port,
                 Some(fallback_user),
             )?;
+            stack.push(jump.alias.clone());
+            self.expand_jumps(&hop.jumps, fallback_user, timeout, stack, out)?;
             anyhow::ensure!(
-                hop.jumps.is_empty(),
-                "nested ProxyJump on {} is unsupported",
-                jump.alias
+                out.len() < MAX_JUMPS,
+                "ProxyJump allows at most four hops"
             );
-            options.jumps.push(self.endpoint(&jump.alias, &hop, timeout)?);
+            // Unsupported policy on this hop fails here, after its own route
+            // has been checked and before it is appended.
+            out.push(self.endpoint(&jump.alias, &hop, timeout)?);
+            stack.pop();
         }
-        options.validate()?;
-        Ok(options)
+        Ok(())
     }
 
     fn endpoint(
@@ -862,9 +890,8 @@ mod tests {
 
     #[test]
     fn userknownhostsfile_none_is_not_a_blocker() {
-        let profile = config("Host dev\nUserKnownHostsFile none")
-            .resolve("dev")
-            .unwrap();
+        let profile =
+            config("Host dev\nUserKnownHostsFile none").resolve("dev").unwrap();
         assert!(profile.unsupported.is_empty());
         assert_eq!(profile.known_hosts.as_deref(), Some(path::Path::new("")));
     }

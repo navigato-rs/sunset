@@ -87,7 +87,8 @@ pub struct Options {
     pub strict_host_key_checking: StrictHostKeyChecking,
     /// Per-operation timeout. OS hostname resolution is not covered by this.
     pub timeout: time::Duration,
-    /// Ordered bastions. Nested routes are rejected before any network access.
+    /// Ordered bastions, outermost first. A hop's own ProxyJump is expanded
+    /// before this list is built, so each entry is one direct next hop.
     pub jumps: Vec<Options>,
 }
 
@@ -637,7 +638,9 @@ impl Connection {
                         }
                         sunset::CliEvent::SessionExit(e) => {
                             self.exit = Some(match e.exit {
-                                sunset::SessionExit::Status(c) => ChannelExit::Status(c),
+                                sunset::SessionExit::Status(c) => {
+                                    ChannelExit::Status(c)
+                                }
                                 sunset::SessionExit::Signal(ref s) => {
                                     ChannelExit::Signal(s.signal.to_string())
                                 }
@@ -920,10 +923,7 @@ impl Channel {
         let Some(handle) = self.connection.handle.as_ref() else {
             return Ok(());
         };
-        self.connection
-            .runner
-            .send_channel_eof(handle)
-            .map_err(protocol)?;
+        self.connection.runner.send_channel_eof(handle).map_err(protocol)?;
         self.connection.flush_socket()?;
         Ok(())
     }
